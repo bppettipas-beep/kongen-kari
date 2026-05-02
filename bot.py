@@ -39,11 +39,30 @@ def load_leaderboards() -> dict:
             return json.load(f)
     return {}
 
-def save_leaderboard(name: str, data: dict):
+def get_guild_leaderboards(guild_id: int) -> dict:
+    return load_leaderboards().get(str(guild_id), {})
+
+def save_leaderboard(guild_id: int, name: str, data: dict):
     all_data = load_leaderboards()
-    all_data[name] = {k: v for k, v in data.items() if k != "author_id"}
+    gkey = str(guild_id)
+    if gkey not in all_data:
+        all_data[gkey] = {}
+    all_data[gkey][name] = {k: v for k, v in data.items() if k not in ("author_id", "lb_name", "guild_id")}
     with open(LB_FILE, "w") as f:
         json.dump(all_data, f, indent=2)
+
+def parse_sort_value(v: str) -> float:
+    v = v.strip().replace(",", "").replace("_", "")
+    suffixes = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}
+    if v and v[-1].lower() in suffixes:
+        try:
+            return float(v[:-1]) * suffixes[v[-1].lower()]
+        except ValueError:
+            pass
+    try:
+        return float(v)
+    except ValueError:
+        return 0.0
 
 def parse_duration(text: str) -> int | None:
     text = text.strip().lower()
@@ -105,11 +124,9 @@ def build_lb_embed(s: dict) -> discord.Embed:
 
     se = entries.copy()
     if sort == "desc":
-        try:    se.sort(key=lambda x: float(x["value"]), reverse=True)
-        except: se.sort(key=lambda x: x["value"], reverse=True)
+        se.sort(key=lambda x: parse_sort_value(x["value"]), reverse=True)
     elif sort == "asc":
-        try:    se.sort(key=lambda x: float(x["value"]))
-        except: se.sort(key=lambda x: x["value"])
+        se.sort(key=lambda x: parse_sort_value(x["value"]))
     elif sort == "name_asc":
         se.sort(key=lambda x: x["name"].lower())
 
@@ -150,7 +167,7 @@ async def _refresh_lb(interaction: discord.Interaction, sid: str):
             embed=build_lb_embed(s),
             view=LeaderboardPanel(sid, s["author_id"]),
         )
-    except discord.NotFound:
+    except (discord.NotFound, discord.HTTPException):
         pass
 
 
@@ -162,13 +179,14 @@ class CreateLBModal(discord.ui.Modal, title="Name Your Leaderboard"):
     async def on_submit(self, interaction: discord.Interaction):
         name = self.lb_name.value.strip()
         sid  = f"{interaction.user.id}_{interaction.id}"
-        all_lbs = load_leaderboards()
-        s = all_lbs[name].copy() if name in all_lbs else {
+        guild_lbs = get_guild_leaderboards(interaction.guild.id)
+        s = guild_lbs[name].copy() if name in guild_lbs else {
             "title": name, "description": "", "entries": [],
             "sort": "none", "show_medals": True,
             "footer_text": "Kongen & Kari's Hangout", "value_label": "",
         }
-        s["lb_name"] = name
+        s["lb_name"]  = name
+        s["guild_id"] = interaction.guild.id
         s["author_id"] = interaction.user.id
         lb_sessions[sid] = s
         await interaction.response.send_message(
@@ -177,7 +195,7 @@ class CreateLBModal(discord.ui.Modal, title="Name Your Leaderboard"):
 
 
 class LBTitleModal(discord.ui.Modal, title="Set Title"):
-    lb_title = discord.ui.TextInput(label="Title", max_length=100)
+    lb_title = discord.ui.TextInput(label="Title", max_length=100, required=False)
 
     def __init__(self, sid: str, current: str = ""):
         super().__init__()
@@ -229,9 +247,9 @@ class LBAddModal(discord.ui.Modal, title="Add Entry"):
 
 
 class LBEditModal(discord.ui.Modal, title="Edit Entry"):
-    index     = discord.ui.TextInput(label="Entry # to edit",          placeholder="e.g. 1", max_length=3)
-    new_name  = discord.ui.TextInput(label="New name  (blank = keep)", required=False,        max_length=100)
-    new_value = discord.ui.TextInput(label="New value (blank = keep)", required=False,        max_length=100)
+    entry_name = discord.ui.TextInput(label="Name of entry to edit", placeholder="Exact name...", max_length=100)
+    new_name   = discord.ui.TextInput(label="New name  (blank = keep)", required=False, max_length=100)
+    new_value  = discord.ui.TextInput(label="New value (blank = keep)", required=False, max_length=100)
 
     def __init__(self, sid: str):
         super().__init__()
@@ -241,22 +259,22 @@ class LBEditModal(discord.ui.Modal, title="Edit Entry"):
         s = lb_sessions.get(self.sid)
         if not s:
             return await interaction.response.send_message("Session expired.", ephemeral=True)
-        try:
-            i = int(self.index.value) - 1
-            if not (0 <= i < len(s["entries"])):
-                raise IndexError
-        except (ValueError, IndexError):
-            return await interaction.response.send_message("Invalid entry number.", ephemeral=True)
+        target = self.entry_name.value.strip().lower()
+        match = next((e for e in s["entries"] if e["name"].lower() == target), None)
+        if match is None:
+            return await interaction.response.send_message(
+                f"No entry named **{self.entry_name.value}** found.", ephemeral=True
+            )
         if self.new_name.value:
-            s["entries"][i]["name"] = self.new_name.value
+            match["name"] = self.new_name.value
         if self.new_value.value:
-            s["entries"][i]["value"] = self.new_value.value
+            match["value"] = self.new_value.value
         await interaction.response.defer()
         await _refresh_lb(interaction, self.sid)
 
 
 class LBRemoveModal(discord.ui.Modal, title="Remove Entry"):
-    index = discord.ui.TextInput(label="Entry # to remove", placeholder="e.g. 2", max_length=3)
+    entry_name = discord.ui.TextInput(label="Name of entry to remove", placeholder="Exact name...", max_length=100)
 
     def __init__(self, sid: str):
         super().__init__()
@@ -266,13 +284,13 @@ class LBRemoveModal(discord.ui.Modal, title="Remove Entry"):
         s = lb_sessions.get(self.sid)
         if not s:
             return await interaction.response.send_message("Session expired.", ephemeral=True)
-        try:
-            i = int(self.index.value) - 1
-            if not (0 <= i < len(s["entries"])):
-                raise IndexError
-        except (ValueError, IndexError):
-            return await interaction.response.send_message("Invalid entry number.", ephemeral=True)
-        s["entries"].pop(i)
+        target = self.entry_name.value.strip().lower()
+        before = len(s["entries"])
+        s["entries"] = [e for e in s["entries"] if e["name"].lower() != target]
+        if len(s["entries"]) == before:
+            return await interaction.response.send_message(
+                f"No entry named **{self.entry_name.value}** found.", ephemeral=True
+            )
         await interaction.response.defer()
         await _refresh_lb(interaction, self.sid)
 
@@ -294,8 +312,7 @@ class LBSettingsModal(discord.ui.Modal, title="Settings"):
         s = lb_sessions.get(self.sid)
         if not s:
             return await interaction.response.send_message("Session expired.", ephemeral=True)
-        if self.footer.value:
-            s["footer_text"] = self.footer.value
+        s["footer_text"] = self.footer.value
         s["value_label"] = self.value_label.value
         s["show_medals"] = self.medals_on.value.strip().lower() in ("yes", "y", "true", "1")
         await interaction.response.defer()
@@ -380,10 +397,14 @@ class LeaderboardPanel(discord.ui.View):
 
     @discord.ui.button(label="Post & Save",  style=discord.ButtonStyle.primary, row=3)
     async def btn_post(self, interaction: discord.Interaction, _: discord.ui.Button):
-        s    = lb_sessions.get(self.sid, {})
-        name = s.get("lb_name", "Untitled")
-        save_leaderboard(name, s)
-        await interaction.channel.send(embed=build_lb_embed(s))
+        s        = lb_sessions.get(self.sid, {})
+        name     = s.get("lb_name", "Untitled")
+        guild_id = s.get("guild_id", interaction.guild.id)
+        try:
+            await interaction.channel.send(embed=build_lb_embed(s))
+        except discord.HTTPException as e:
+            return await interaction.response.send_message(f"Failed to post: {e}", ephemeral=True)
+        save_leaderboard(guild_id, name, s)
         await interaction.response.send_message(
             f"Leaderboard **{name}** posted and saved. Edit it later with `/editleaderboard`.",
             ephemeral=True,
@@ -606,7 +627,8 @@ def build_cc_setup_embed(s: dict) -> discord.Embed:
         ),
         inline=False,
     )
-    embed.set_footer(text="Counts ALL past messages on start  •  Updates every 30 s after")
+    mode_note = "Only counts NEW messages (reset period active)" if interval else "Counts ALL past messages on start"
+    embed.set_footer(text=f"{mode_note}  •  Updates every 30 s")
     return embed
 
 
@@ -619,7 +641,7 @@ async def _refresh_cc(interaction: discord.Interaction, sid: str):
             embed=build_cc_setup_embed(s),
             view=CCSetupPanel(sid, s["author_id"]),
         )
-    except discord.NotFound:
+    except (discord.NotFound, discord.HTTPException):
         pass
 
 
@@ -668,42 +690,43 @@ class CCSetupPanel(discord.ui.View):
 
     @discord.ui.button(label="Start Counting", style=discord.ButtonStyle.primary, row=1)
     async def btn_start(self, interaction: discord.Interaction, _: discord.ui.Button):
-        s    = cc_sessions.get(self.sid, {})
-        name = s.get("cc_name", "Chat Counter")
+        s     = cc_sessions.get(self.sid, {})
+        name  = s.get("cc_name", "Chat Counter")
         guild = interaction.guild
 
-        msg = await interaction.channel.send(
-            embed=build_cc_embed({**s, "counts": {}, "counting_history": True}, guild)
+        has_reset = bool(s.get("reset_interval"))
+        after_dt  = datetime.now(timezone.utc) if has_reset else None
+
+        live_msg = await interaction.channel.send(
+            embed=build_cc_embed({**s, "counts": {}, "counting_history": not has_reset}, guild)
         )
 
         counter = {
-            "guild_id":        guild.id,
-            "channel_id":      interaction.channel_id,
-            "message_id":      msg.id,
-            "title":           s.get("title", name),
-            "footer_text":     s.get("footer_text", "Kongen & Kari's Hangout"),
-            "show_medals":     s.get("show_medals", True),
-            "top_n":           s.get("top_n", 10),
-            "counts":          {},
-            "counting_history": True,
-            "last_counted_at": None,
-            "reset_interval":  s.get("reset_interval"),
+            "guild_id":         guild.id,
+            "channel_id":       interaction.channel_id,
+            "message_id":       live_msg.id,
+            "title":            s.get("title", name),
+            "footer_text":      s.get("footer_text", "Kongen & Kari's Hangout"),
+            "show_medals":      s.get("show_medals", True),
+            "top_n":            s.get("top_n", 10),
+            "counts":           {},
+            "counting_history": not has_reset,
+            "last_counted_at":  None,
+            "reset_interval":   s.get("reset_interval"),
             "reset_at": (
                 (datetime.now(timezone.utc) + timedelta(seconds=s["reset_interval"])).isoformat()
-                if s.get("reset_interval") else None
+                if has_reset else None
             ),
         }
         chat_counters[name] = counter
         save_chat_counters()
 
-        has_reset = bool(s.get("reset_interval"))
-        after_dt = datetime.now(timezone.utc) if has_reset else None
-        msg = (
+        confirm = (
             f"**{name}** started! Only new messages will be counted (reset period is active)."
             if has_reset else
             f"**{name}** started! Counting all past messages now, this may take a few minutes."
         )
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.send_message(confirm, ephemeral=True)
         cc_sessions.pop(self.sid, None)
         for item in self.children:
             item.disabled = True
@@ -1116,9 +1139,10 @@ async def leaderboard_cmd(interaction: discord.Interaction, type: str, name: str
 
 
 async def lb_autocomplete(interaction: discord.Interaction, current: str):
+    guild_lbs = get_guild_leaderboards(interaction.guild.id)
     return [
         app_commands.Choice(name=n, value=n)
-        for n in load_leaderboards() if current.lower() in n.lower()
+        for n in guild_lbs if current.lower() in n.lower()
     ][:25]
 
 
@@ -1127,12 +1151,13 @@ async def lb_autocomplete(interaction: discord.Interaction, current: str):
 @app_commands.describe(name="Name of the leaderboard to edit")
 @app_commands.autocomplete(name=lb_autocomplete)
 async def editleaderboard_cmd(interaction: discord.Interaction, name: str):
-    all_lbs = load_leaderboards()
-    if name not in all_lbs:
+    guild_lbs = get_guild_leaderboards(interaction.guild.id)
+    if name not in guild_lbs:
         return await interaction.response.send_message(f"No leaderboard named **{name}** found.", ephemeral=True)
     sid = f"{interaction.user.id}_{interaction.id}"
-    s   = all_lbs[name].copy()
+    s   = guild_lbs[name].copy()
     s["lb_name"]   = name
+    s["guild_id"]  = interaction.guild.id
     s["author_id"] = interaction.user.id
     lb_sessions[sid] = s
     await interaction.response.send_message(
@@ -1212,4 +1237,3 @@ if __name__ == "__main__":
     if not token:
         raise SystemExit("ERROR: DISCORD_TOKEN not set in .env")
     bot.run(token)
-
