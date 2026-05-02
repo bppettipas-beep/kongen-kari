@@ -4,7 +4,8 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import os
 import json
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -43,6 +44,38 @@ def save_leaderboard(name: str, data: dict):
     all_data[name] = {k: v for k, v in data.items() if k != "author_id"}
     with open(LB_FILE, "w") as f:
         json.dump(all_data, f, indent=2)
+
+def parse_duration(text: str) -> int | None:
+    text = text.strip().lower()
+    units = [
+        (r'(\d+(?:\.\d+)?)\s*y(?:ear)?s?',       365 * 86400),
+        (r'(\d+(?:\.\d+)?)\s*mo(?:nth)?s?',        30 * 86400),
+        (r'(\d+(?:\.\d+)?)\s*w(?:eek)?s?',          7 * 86400),
+        (r'(\d+(?:\.\d+)?)\s*d(?:ay)?s?',               86400),
+        (r'(\d+(?:\.\d+)?)\s*h(?:our|r)?s?',             3600),
+        (r'(\d+(?:\.\d+)?)\s*m(?:in(?:ute)?)?s?',          60),
+        (r'(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?)?s?',           1),
+    ]
+    total = 0
+    found = False
+    for pattern, multiplier in units:
+        for m in re.finditer(pattern, text):
+            total += float(m.group(1)) * multiplier
+            found = True
+    return int(total) if found else None
+
+def format_duration(seconds: int) -> str:
+    if seconds >= 365 * 86400:
+        return f"{seconds // (365 * 86400)} year(s)"
+    if seconds >= 30 * 86400:
+        return f"{seconds // (30 * 86400)} month(s)"
+    if seconds >= 7 * 86400:
+        return f"{seconds // (7 * 86400)} week(s)"
+    if seconds >= 86400:
+        return f"{seconds // 86400} day(s)"
+    if seconds >= 3600:
+        return f"{seconds // 3600} hour(s)"
+    return f"{seconds // 60} minute(s)"
 
 def save_chat_counters():
     with open(CC_FILE, "w") as f:
@@ -389,7 +422,15 @@ def build_cc_embed(counter: dict, guild: discord.Guild) -> discord.Embed:
             lines.append(f"{rank}  **{dname}**  —  {count:,} messages")
         embed.description = "\n".join(lines)
 
-    status = "  •  Counting history, please wait..." if counting else "  •  Updates every 30 s"
+    if counting:
+        status = "  •  Counting history, please wait..."
+    else:
+        reset_at = counter.get("reset_at")
+        if reset_at:
+            dt = datetime.fromisoformat(reset_at).replace(tzinfo=timezone.utc)
+            status = f"  •  Resets <t:{int(dt.timestamp())}:R>"
+        else:
+            status = "  •  Updates every 30 s"
     embed.set_footer(text=f"{footer_text}{status}")
     return embed
 
@@ -447,7 +488,16 @@ async def count_history(name: str, after_dt: datetime | None = None):
 
 @tasks.loop(seconds=30)
 async def update_all_counters():
-    for name in list(chat_counters):
+    now = datetime.now(timezone.utc)
+    for name, counter in list(chat_counters.items()):
+        reset_at = counter.get("reset_at")
+        interval = counter.get("reset_interval")
+        if reset_at and interval:
+            dt = datetime.fromisoformat(reset_at).replace(tzinfo=timezone.utc)
+            if now >= dt:
+                counter["counts"]   = {}
+                counter["reset_at"] = (now + timedelta(seconds=interval)).isoformat()
+                print(f"[RESET] Counter '{name}' reset. Next reset: {counter['reset_at']}")
         await update_counter_embed(name)
     save_chat_counters()
 
@@ -508,14 +558,50 @@ class CCTopNModal(discord.ui.Modal, title="Top N"):
         await _refresh_cc(interaction, self.sid)
 
 
+class CCResetModal(discord.ui.Modal, title="Set Reset Period"):
+    period = discord.ui.TextInput(
+        label="Reset Period",
+        placeholder="e.g. 1hr  30 days  2 months  1 year  (blank = never reset)",
+        required=False,
+        max_length=20,
+    )
+
+    def __init__(self, sid: str, current: str = ""):
+        super().__init__()
+        self.sid = sid
+        self.period.default = current
+
+    async def on_submit(self, interaction: discord.Interaction):
+        s = cc_sessions.get(self.sid)
+        if not s:
+            return await interaction.response.send_message("Session expired.", ephemeral=True)
+        text = self.period.value.strip()
+        if not text:
+            s["reset_interval"] = None
+            s["reset_display"]  = ""
+        else:
+            seconds = parse_duration(text)
+            if seconds is None:
+                return await interaction.response.send_message(
+                    "Invalid format. Examples: `1hr`, `30 days`, `2 months`, `1 year`", ephemeral=True
+                )
+            s["reset_interval"] = seconds
+            s["reset_display"]  = text
+        await interaction.response.defer()
+        await _refresh_cc(interaction, self.sid)
+
+
 def build_cc_setup_embed(s: dict) -> discord.Embed:
     embed = discord.Embed(title=f"\U0001f4ac  {s.get('title', 'Chat Leaderboard')}", color=GOLD)
     embed.description = "*No messages counted yet. Configure below then click Start Counting.*"
+    interval = s.get("reset_interval")
+    reset_display = format_duration(interval) if interval else "None (never resets)"
     embed.add_field(
         name="Settings",
         value=(
             f"**Top N:** {s.get('top_n', 10)} users\n"
             f"**Medals:** {'Yes' if s.get('show_medals', True) else 'No'}\n"
+            f"**Reset Every:** {reset_display}\n"
             f"**Footer:** {s.get('footer_text', 'Kongen & Kari\'s Hangout')}"
         ),
         inline=False,
@@ -575,6 +661,11 @@ class CCSetupPanel(discord.ui.View):
         await interaction.response.defer()
         await _refresh_cc(interaction, self.sid)
 
+    @discord.ui.button(label="Reset Period",   style=discord.ButtonStyle.secondary, row=1)
+    async def btn_reset(self, interaction: discord.Interaction, _: discord.ui.Button):
+        s = cc_sessions.get(self.sid, {})
+        await interaction.response.send_modal(CCResetModal(self.sid, s.get("reset_display", "")))
+
     @discord.ui.button(label="Start Counting", style=discord.ButtonStyle.primary, row=1)
     async def btn_start(self, interaction: discord.Interaction, _: discord.ui.Button):
         s    = cc_sessions.get(self.sid, {})
@@ -596,6 +687,11 @@ class CCSetupPanel(discord.ui.View):
             "counts":          {},
             "counting_history": True,
             "last_counted_at": None,
+            "reset_interval":  s.get("reset_interval"),
+            "reset_at": (
+                (datetime.now(timezone.utc) + timedelta(seconds=s["reset_interval"])).isoformat()
+                if s.get("reset_interval") else None
+            ),
         }
         chat_counters[name] = counter
         save_chat_counters()
@@ -984,6 +1080,7 @@ class EmbedPanel(discord.ui.View):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @bot.tree.command(name="leaderboard", description="Create a leaderboard")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     type="Type of leaderboard",
     name="Name for the chat counter (required for chat_counter type)",
@@ -1022,6 +1119,7 @@ async def lb_autocomplete(interaction: discord.Interaction, current: str):
 
 
 @bot.tree.command(name="editleaderboard", description="Edit a saved leaderboard")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(name="Name of the leaderboard to edit")
 @app_commands.autocomplete(name=lb_autocomplete)
 async def editleaderboard_cmd(interaction: discord.Interaction, name: str):
@@ -1039,6 +1137,7 @@ async def editleaderboard_cmd(interaction: discord.Interaction, name: str):
 
 
 @bot.tree.command(name="embed", description="Build and post a fully custom embed")
+@app_commands.default_permissions(administrator=True)
 async def embed_cmd(interaction: discord.Interaction):
     sid = f"{interaction.user.id}_{interaction.id}"
     emb_sessions[sid] = _blank_emb(interaction.user.id)
