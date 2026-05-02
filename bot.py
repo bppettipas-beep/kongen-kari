@@ -64,14 +64,35 @@ def parse_sort_value(v: str) -> float:
     except ValueError:
         return 0.0
 
-def format_int_value(v: str) -> str | None:
-    """Parse an integer value (commas allowed as separators) and return it comma-formatted.
-    Returns None if the input is not a valid integer."""
-    try:
-        n = int(v.strip().replace(",", "").replace("_", ""))
-        return f"{n:,}"
-    except ValueError:
-        return None
+def normalize_value(v: str) -> str:
+    """Convert any numeric input to clean shorthand (1000000000 → 1B, 1b → 1B, 1500 → 1.5K).
+    Non-numeric strings are returned unchanged."""
+    test = v.strip().replace(",", "").replace("_", "")
+    is_numeric = False
+    if test and test[-1].lower() in ("k", "m", "b", "t"):
+        try:
+            float(test[:-1])
+            is_numeric = True
+        except ValueError:
+            pass
+    if not is_numeric:
+        try:
+            float(test)
+            is_numeric = True
+        except ValueError:
+            pass
+    if not is_numeric:
+        return v
+    num = parse_sort_value(v)
+    if abs(num) >= 1e12:
+        return f"{num / 1e12:g}T"
+    if abs(num) >= 1e9:
+        return f"{num / 1e9:g}B"
+    if abs(num) >= 1e6:
+        return f"{num / 1e6:g}M"
+    if abs(num) >= 1e3:
+        return f"{num / 1e3:g}K"
+    return f"{num:g}"
 
 def parse_duration(text: str) -> int | None:
     text = text.strip().lower()
@@ -250,12 +271,7 @@ class LBAddModal(discord.ui.Modal, title="Add Entry"):
         s = lb_sessions.get(self.sid)
         if not s:
             return await interaction.response.send_message("Session expired.", ephemeral=True)
-        formatted = format_int_value(self.value.value)
-        if formatted is None:
-            return await interaction.response.send_message(
-                "Invalid value — enter a whole number only, e.g. `2000000` or `500`.", ephemeral=True
-            )
-        s["entries"].append({"name": self.name.value, "value": formatted})
+        s["entries"].append({"name": self.name.value, "value": normalize_value(self.value.value)})
         await interaction.response.defer()
         await _refresh_lb(interaction, self.sid)
 
@@ -282,12 +298,7 @@ class LBEditModal(discord.ui.Modal, title="Edit Entry"):
         if self.new_name.value:
             match["name"] = self.new_name.value
         if self.new_value.value:
-            formatted = format_int_value(self.new_value.value)
-            if formatted is None:
-                return await interaction.response.send_message(
-                    "Invalid value — enter a whole number only, e.g. `2000000` or `500`.", ephemeral=True
-                )
-            match["value"] = formatted
+            match["value"] = normalize_value(self.new_value.value)
         await interaction.response.defer()
         await _refresh_lb(interaction, self.sid)
 
