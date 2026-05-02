@@ -1066,6 +1066,20 @@ async def on_message(message: discord.Message):
 
 
 @bot.event
+async def on_guild_join(guild: discord.Guild):
+    print(f"[JOIN] Joined guild: {guild.name} (ID: {guild.id}) | Members: {guild.member_count}")
+    print(f"[JOIN] Owner: {guild.owner} | Region: {guild.preferred_locale}")
+    print(f"[JOIN] Bot roles: {[r.name for r in guild.me.roles]}")
+    print(f"[JOIN] Bot permissions: {guild.me.guild_permissions.value}")
+
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    print(f"[LEAVE] Removed from guild: {guild.name} (ID: {guild.id})")
+    print(f"[LEAVE] This could mean: kicked, banned, or guild deleted")
+
+
+@bot.event
 async def on_ready():
     global chat_counters
     if os.path.exists(CC_FILE):
