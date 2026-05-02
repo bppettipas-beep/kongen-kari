@@ -696,15 +696,19 @@ class CCSetupPanel(discord.ui.View):
         chat_counters[name] = counter
         save_chat_counters()
 
-        await interaction.response.send_message(
-            f"**{name}** started! Counting all past messages now, this may take a few minutes.",
-            ephemeral=True,
+        has_reset = bool(s.get("reset_interval"))
+        after_dt = datetime.now(timezone.utc) if has_reset else None
+        msg = (
+            f"**{name}** started! Only new messages will be counted (reset period is active)."
+            if has_reset else
+            f"**{name}** started! Counting all past messages now, this may take a few minutes."
         )
+        await interaction.response.send_message(msg, ephemeral=True)
         cc_sessions.pop(self.sid, None)
         for item in self.children:
             item.disabled = True
         self.stop()
-        asyncio.create_task(count_history(name, after_dt=None))
+        asyncio.create_task(count_history(name, after_dt=after_dt))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1208,3 +1212,4 @@ if __name__ == "__main__":
     if not token:
         raise SystemExit("ERROR: DISCORD_TOKEN not set in .env")
     bot.run(token)
+
