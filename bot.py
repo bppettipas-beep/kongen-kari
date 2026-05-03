@@ -557,6 +557,15 @@ async def update_all_counters():
                 print(f"[RESET] Counter '{name}' reset. Next reset: {counter['reset_at']}")
         await update_counter_embed(name)
     save_chat_counters()
+    await _update_presence()
+
+
+async def _update_presence():
+    total = sum(g.member_count for g in bot.guilds)
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.watching,
+        name=f"{total:,} members",
+    ))
 
 
 # ── Chat Counter Setup ────────────────────────────────────────────────────────
@@ -1519,6 +1528,7 @@ async def on_ready():
 
     update_all_counters.start()
     giveaway_checker.start()
+    await _update_presence()
 
     for guild in GUILD_IDS:
         try:
