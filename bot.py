@@ -561,10 +561,11 @@ async def update_all_counters():
 
 
 async def _update_presence():
-    total = sum(g.member_count for g in bot.guilds)
+    guild = bot.get_guild(1466873878973386931)
+    count = guild.member_count if guild else 0
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.watching,
-        name=f"{total:,} members",
+        name=f"{count:,} members",
     ))
 
 
