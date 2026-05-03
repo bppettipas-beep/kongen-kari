@@ -22,11 +22,37 @@ GUILD_IDS = [
 ]
 GOLD     = 0xFFD700
 MEDALS   = ["🥇", "🥈", "🥉"]
-LB_FILE  = "leaderboards.json"
-CC_FILE  = "chat_counters.json"
-GW_FILE  = "giveaways.json"
+DATA_DIR = os.getenv("DATA_DIR", ".")
+LB_FILE  = os.path.join(DATA_DIR, "leaderboards.json")
+CC_FILE  = os.path.join(DATA_DIR, "chat_counters.json")
+GW_FILE  = os.path.join(DATA_DIR, "giveaways.json")
 
 GW_YELLOW = 0xFFD700
+
+RESTORE_CODES = {
+    "RESTORE-MONTHLY-AK7": {
+        "title": "💬  Monthly Message Leaderboard",
+        "reset_at_ts": 1780332566,
+        "reset_interval": 30 * 86400,
+        "seed": {
+            "Kongen": 117, "Mod | Bryce": 106, "Dev | Goose": 98,
+            "! 𝐊𝐚𝐫𝐢": 67, "Chat Mod | Sully": 60, "Sr Helper | Jynxy": 47,
+            "𝓼𝓻𝓲 |": 34, "chat mod | Optimal": 33, "Sr Mod | minnk.": 31,
+            "Mod | AlexGrundi": 29,
+        },
+    },
+    "RESTORE-WEEKLY-BN4": {
+        "title": "💬  Weekly Message Leaderboard",
+        "reset_at_ts": 1778345280,
+        "reset_interval": 7 * 86400,
+        "seed": {
+            "Kongen": 118, "Mod | Bryce": 106, "Dev | Goose": 98,
+            "! 𝐊𝐚𝐫𝐢": 67, "Chat Mod | Sully": 60, "Sr Helper | Jynxy": 47,
+            "𝓼𝓻𝓲 |": 34, "chat mod | Optimal": 33, "Sr Mod | minnk.": 31,
+            "Mod | AlexGrundi": 29,
+        },
+    },
+}
 GW_GRAY   = 0x95A5A6
 
 COLORS = {
@@ -473,9 +499,12 @@ def build_cc_embed(counter: dict, guild: discord.Guild) -> discord.Embed:
     else:
         lines = []
         for i, (uid, count) in enumerate(sorted_counts):
-            member = guild.get_member(int(uid))
-            dname  = member.display_name if member else f"User {uid}"
-            rank   = MEDALS[i] if (show_medals and i < 3) else f"`#{i+1}`"
+            try:
+                member = guild.get_member(int(uid))
+                dname  = member.display_name if member else f"User {uid}"
+            except (ValueError, TypeError):
+                dname = uid  # seeded entry stored as display name string
+            rank = MEDALS[i] if (show_medals and i < 3) else f"`#{i+1}`"
             lines.append(f"{rank}  **{dname}**  —  {count:,} messages")
         embed.description = "\n".join(lines)
 
@@ -1328,6 +1357,42 @@ async def leaderboard_cmd(interaction: discord.Interaction, type: str, name: str
             return await interaction.response.send_message("Provide a `name:` for the chat counter.", ephemeral=True)
         if name in chat_counters:
             return await interaction.response.send_message(f"A counter named **{name}** already exists.", ephemeral=True)
+
+        if name in RESTORE_CODES:
+            restore = RESTORE_CODES[name]
+            counts  = {}
+            for dname, count in restore["seed"].items():
+                member = discord.utils.find(
+                    lambda m, d=dname: m.display_name == d or m.name == d,
+                    interaction.guild.members,
+                )
+                counts[str(member.id) if member else dname] = count
+            reset_iso = datetime.fromtimestamp(restore["reset_at_ts"], tz=timezone.utc).isoformat()
+            counter = {
+                "guild_id":         interaction.guild.id,
+                "channel_id":       interaction.channel_id,
+                "message_id":       0,
+                "title":            restore["title"],
+                "footer_text":      "Kongen & Kari's Hangout",
+                "show_medals":      True,
+                "top_n":            10,
+                "counts":           counts,
+                "counting_history": False,
+                "last_counted_at":  datetime.now(timezone.utc).isoformat(),
+                "reset_interval":   restore["reset_interval"],
+                "reset_at":         reset_iso,
+            }
+            live_msg = await interaction.channel.send(
+                embed=build_cc_embed(counter, interaction.guild)
+            )
+            counter["message_id"] = live_msg.id
+            chat_counters[name]   = counter
+            save_chat_counters()
+            return await interaction.response.send_message(
+                f"Restored **{restore['title']}** with previous counts. Tracking new messages from now.",
+                ephemeral=True,
+            )
+
         sid = f"{interaction.user.id}_{interaction.id}"
         cc_sessions[sid] = {
             "cc_name": name, "title": name,
