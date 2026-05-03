@@ -1520,10 +1520,6 @@ async def on_ready():
     update_all_counters.start()
     giveaway_checker.start()
 
-    # Clear any stale global commands (removes duplicates and old commands from bad deploys)
-    bot.tree.clear_commands(guild=None)
-    await bot.tree.sync()
-
     for guild in GUILD_IDS:
         try:
             bot.tree.copy_global_to(guild=guild)
@@ -1531,6 +1527,10 @@ async def on_ready():
             print(f"Synced {len(synced)} slash command(s) to guild {guild.id}")
         except discord.Forbidden:
             print(f"Bot not in guild {guild.id} — skipping")
+
+    # Clear stale global commands after guild sync (removes /chatleaderboard and duplicates)
+    bot.tree.clear_commands(guild=None)
+    await bot.tree.sync()
 
 
 if __name__ == "__main__":
