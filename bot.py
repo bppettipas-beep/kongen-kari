@@ -14,7 +14,28 @@ load_dotenv()
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+def _is_admin(user: discord.Member | discord.User) -> bool:
+    return isinstance(user, discord.Member) and user.guild_permissions.administrator
+
+
+class RestrictedCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if _is_admin(interaction.user):
+            return True
+        settings = load_guild_settings().get(str(interaction.guild_id), {})
+        if not settings.get("enabled") or not settings.get("command_channels"):
+            return True
+        if interaction.channel_id in settings["command_channels"]:
+            return True
+        await interaction.response.send_message(
+            "Commands are not allowed in this channel.", ephemeral=True
+        )
+        return False
+
+
+bot = commands.Bot(command_prefix="!", intents=intents, tree_cls=RestrictedCommandTree)
 
 GUILD_IDS = [
     discord.Object(id=1488636168709996548),
@@ -26,6 +47,7 @@ DATA_DIR = os.getenv("DATA_DIR", ".")
 LB_FILE  = os.path.join(DATA_DIR, "leaderboards.json")
 CC_FILE  = os.path.join(DATA_DIR, "chat_counters.json")
 GW_FILE  = os.path.join(DATA_DIR, "giveaways.json")
+GS_FILE  = os.path.join(DATA_DIR, "guild_settings.json")
 
 GW_YELLOW = 0xFFD700
 
@@ -160,6 +182,16 @@ def format_duration(seconds: int) -> str:
 def save_chat_counters():
     with open(CC_FILE, "w") as f:
         json.dump(chat_counters, f, indent=2)
+
+def load_guild_settings() -> dict:
+    if os.path.exists(GS_FILE):
+        with open(GS_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_guild_settings(data: dict):
+    with open(GS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 # ─── In-memory state ──────────────────────────────────────────────────────────
 
@@ -1336,6 +1368,83 @@ async def before_giveaway_checker():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  COMMANDBLOCK
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+commandblock = app_commands.Group(
+    name="commandblock",
+    description="Restrict which channels commands can be used in",
+    default_permissions=discord.Permissions(administrator=True),
+)
+
+@commandblock.command(name="add", description="Allow commands in a channel")
+@app_commands.describe(channel="Channel to allow commands in")
+async def cb_add(interaction: discord.Interaction, channel: discord.TextChannel):
+    gid = str(interaction.guild_id)
+    data = load_guild_settings()
+    gs = data.setdefault(gid, {"enabled": True, "command_channels": []})
+    if channel.id not in gs["command_channels"]:
+        gs["command_channels"].append(channel.id)
+        gs["enabled"] = True
+    save_guild_settings(data)
+    channels = gs["command_channels"]
+    mentions = " ".join(f"<#{c}>" for c in channels)
+    await interaction.response.send_message(
+        f"Commands are now restricted to: {mentions}", ephemeral=True
+    )
+
+@commandblock.command(name="remove", description="Remove a channel from the allowed list")
+@app_commands.describe(channel="Channel to remove from the allowed list")
+async def cb_remove(interaction: discord.Interaction, channel: discord.TextChannel):
+    gid = str(interaction.guild_id)
+    data = load_guild_settings()
+    gs = data.get(gid, {})
+    channels: list = gs.get("command_channels", [])
+    if channel.id in channels:
+        channels.remove(channel.id)
+        gs["command_channels"] = channels
+        data[gid] = gs
+        save_guild_settings(data)
+    if channels:
+        mentions = " ".join(f"<#{c}>" for c in channels)
+        await interaction.response.send_message(
+            f"Removed. Commands are now restricted to: {mentions}", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "No allowed channels left — restrictions are now effectively off. Use `/commandblock clear` to disable.", ephemeral=True
+        )
+
+@commandblock.command(name="list", description="Show the current channel allowlist")
+async def cb_list(interaction: discord.Interaction):
+    gid = str(interaction.guild_id)
+    gs = load_guild_settings().get(gid, {})
+    channels: list = gs.get("command_channels", [])
+    if not gs.get("enabled") or not channels:
+        await interaction.response.send_message("No channel restrictions are active.", ephemeral=True)
+        return
+    mentions = "\n".join(f"• <#{c}>" for c in channels)
+    embed = discord.Embed(
+        title="Command Channel Allowlist",
+        description=f"Commands are only usable in:\n{mentions}",
+        color=GOLD,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@commandblock.command(name="clear", description="Remove all channel restrictions — allow commands everywhere")
+async def cb_clear(interaction: discord.Interaction):
+    gid = str(interaction.guild_id)
+    data = load_guild_settings()
+    data.pop(gid, None)
+    save_guild_settings(data)
+    await interaction.response.send_message(
+        "Channel restrictions cleared. Commands are now allowed everywhere.", ephemeral=True
+    )
+
+bot.tree.add_command(commandblock)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SLASH COMMANDS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1555,6 +1664,11 @@ async def on_message(message: discord.Message):
     for counter in chat_counters.values():
         if counter.get("guild_id") == guild_id and not counter.get("counting_history", False):
             counter["counts"][uid] = counter["counts"].get(uid, 0) + 1
+    if not _is_admin(message.author):
+        gs = load_guild_settings().get(str(guild_id), {})
+        if gs.get("enabled") and gs.get("command_channels"):
+            if message.channel.id not in gs["command_channels"]:
+                return
     await bot.process_commands(message)
 
 
