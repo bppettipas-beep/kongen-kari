@@ -49,6 +49,8 @@ CC_FILE  = os.path.join(DATA_DIR, "chat_counters.json")
 GW_FILE  = os.path.join(DATA_DIR, "giveaways.json")
 GS_FILE  = os.path.join(DATA_DIR, "guild_settings.json")
 
+COMMAND_RE = re.compile(r"^[^\w\s]\w", re.UNICODE)
+
 GW_YELLOW = 0xFFD700
 
 RESTORE_CODES = {
@@ -1371,77 +1373,111 @@ async def before_giveaway_checker():
 #  COMMANDBLOCK
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-commandblock = app_commands.Group(
-    name="commandblock",
-    description="Restrict which channels commands can be used in",
-    default_permissions=discord.Permissions(administrator=True),
-)
+class CommandBlockView(discord.ui.View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.gid   = str(guild.id)
+        self._populate()
 
-@commandblock.command(name="add", description="Allow commands in a channel")
-@app_commands.describe(channel="Channel to allow commands in")
-async def cb_add(interaction: discord.Interaction, channel: discord.TextChannel):
-    gid = str(interaction.guild_id)
-    data = load_guild_settings()
-    gs = data.setdefault(gid, {"enabled": True, "command_channels": []})
-    if channel.id not in gs["command_channels"]:
-        gs["command_channels"].append(channel.id)
-        gs["enabled"] = True
-    save_guild_settings(data)
-    channels = gs["command_channels"]
-    mentions = " ".join(f"<#{c}>" for c in channels)
-    await interaction.response.send_message(
-        f"Commands are now restricted to: {mentions}", ephemeral=True
-    )
+    def _settings(self) -> dict:
+        return load_guild_settings().get(self.gid, {"enabled": False, "command_channels": []})
 
-@commandblock.command(name="remove", description="Remove a channel from the allowed list")
-@app_commands.describe(channel="Channel to remove from the allowed list")
-async def cb_remove(interaction: discord.Interaction, channel: discord.TextChannel):
-    gid = str(interaction.guild_id)
-    data = load_guild_settings()
-    gs = data.get(gid, {})
-    channels: list = gs.get("command_channels", [])
-    if channel.id in channels:
-        channels.remove(channel.id)
-        gs["command_channels"] = channels
-        data[gid] = gs
-        save_guild_settings(data)
-    if channels:
-        mentions = " ".join(f"<#{c}>" for c in channels)
-        await interaction.response.send_message(
-            f"Removed. Commands are now restricted to: {mentions}", ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            "No allowed channels left — restrictions are now effectively off. Use `/commandblock clear` to disable.", ephemeral=True
+    def build_embed(self) -> discord.Embed:
+        s        = self._settings()
+        enabled  = s.get("enabled", False)
+        channels = s.get("command_channels", [])
+        status   = "🟢 Active" if enabled else "🔴 Disabled"
+        ch_list  = "\n".join(f"• <#{c}>" for c in channels) if channels else "*None — add channels below*"
+        embed    = discord.Embed(title="🔒 Command Channel Restrictions", color=GOLD if enabled else GW_GRAY)
+        embed.add_field(name="Status", value=status, inline=True)
+        embed.add_field(name="Allowed Channels", value=ch_list, inline=True)
+        if enabled and not channels:
+            embed.set_footer(text="⚠️ Active with no allowed channels — commands blocked everywhere!")
+        elif enabled:
+            embed.set_footer(text="Commands only work in allowed channels • Admins are always exempt")
+        else:
+            embed.set_footer(text="Restrictions off — commands work in all channels")
+        return embed
+
+    def _populate(self):
+        s        = self._settings()
+        enabled  = s.get("enabled", False)
+        channels = s.get("command_channels", [])
+
+        # ── Row 0: enable/disable toggle ─────────────────────
+        btn = discord.ui.Button(
+            label="Disable Restrictions" if enabled else "Enable Restrictions",
+            style=discord.ButtonStyle.danger if enabled else discord.ButtonStyle.success,
+            row=0,
         )
 
-@commandblock.command(name="list", description="Show the current channel allowlist")
-async def cb_list(interaction: discord.Interaction):
-    gid = str(interaction.guild_id)
-    gs = load_guild_settings().get(gid, {})
-    channels: list = gs.get("command_channels", [])
-    if not gs.get("enabled") or not channels:
-        await interaction.response.send_message("No channel restrictions are active.", ephemeral=True)
-        return
-    mentions = "\n".join(f"• <#{c}>" for c in channels)
-    embed = discord.Embed(
-        title="Command Channel Allowlist",
-        description=f"Commands are only usable in:\n{mentions}",
-        color=GOLD,
-    )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+        async def _toggle(interaction: discord.Interaction):
+            data = load_guild_settings()
+            gs   = data.setdefault(self.gid, {"enabled": False, "command_channels": []})
+            gs["enabled"] = not gs.get("enabled", False)
+            save_guild_settings(data)
+            v = CommandBlockView(self.guild)
+            await interaction.response.edit_message(embed=v.build_embed(), view=v)
 
-@commandblock.command(name="clear", description="Remove all channel restrictions — allow commands everywhere")
-async def cb_clear(interaction: discord.Interaction):
-    gid = str(interaction.guild_id)
-    data = load_guild_settings()
-    data.pop(gid, None)
-    save_guild_settings(data)
-    await interaction.response.send_message(
-        "Channel restrictions cleared. Commands are now allowed everywhere.", ephemeral=True
-    )
+        btn.callback = _toggle
+        self.add_item(btn)
 
-bot.tree.add_command(commandblock)
+        # ── Row 1: add-channel select ─────────────────────────
+        add_sel = discord.ui.ChannelSelect(
+            placeholder="Add a channel to the allowlist…",
+            channel_types=[discord.ChannelType.text],
+            row=1,
+        )
+
+        async def _add(interaction: discord.Interaction):
+            cid  = add_sel.values[0].id
+            data = load_guild_settings()
+            gs   = data.setdefault(self.gid, {"enabled": enabled, "command_channels": []})
+            if cid not in gs["command_channels"]:
+                gs["command_channels"].append(cid)
+            save_guild_settings(data)
+            v = CommandBlockView(self.guild)
+            await interaction.response.edit_message(embed=v.build_embed(), view=v)
+
+        add_sel.callback = _add
+        self.add_item(add_sel)
+
+        # ── Row 2: remove-channel select (only when list non-empty) ──
+        if channels:
+            opts = []
+            for cid in channels:
+                ch   = self.guild.get_channel(cid)
+                name = f"#{ch.name}" if ch else f"Deleted channel ({cid})"
+                opts.append(discord.SelectOption(label=name, value=str(cid)))
+            rm_sel = discord.ui.Select(
+                placeholder="Remove a channel from the allowlist…",
+                options=opts,
+                row=2,
+            )
+
+            async def _remove(interaction: discord.Interaction):
+                cid  = int(rm_sel.values[0])
+                data = load_guild_settings()
+                gs   = data.get(self.gid, {})
+                chs  = gs.get("command_channels", [])
+                if cid in chs:
+                    chs.remove(cid)
+                    gs["command_channels"] = chs
+                    data[self.gid] = gs
+                    save_guild_settings(data)
+                v = CommandBlockView(self.guild)
+                await interaction.response.edit_message(embed=v.build_embed(), view=v)
+
+            rm_sel.callback = _remove
+            self.add_item(rm_sel)
+
+
+@bot.tree.command(name="commandblock", description="Manage which channels commands are allowed in")
+@app_commands.default_permissions(administrator=True)
+async def commandblock_cmd(interaction: discord.Interaction):
+    view = CommandBlockView(interaction.guild)
+    await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1668,6 +1704,11 @@ async def on_message(message: discord.Message):
         gs = load_guild_settings().get(str(guild_id), {})
         if gs.get("enabled") and gs.get("command_channels"):
             if message.channel.id not in gs["command_channels"]:
+                if COMMAND_RE.search(message.content):
+                    try:
+                        await message.delete()
+                    except discord.Forbidden:
+                        pass
                 return
     await bot.process_commands(message)
 
