@@ -1480,6 +1480,16 @@ async def commandblock_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
 
+@bot.check
+async def _prefix_channel_check(ctx: commands.Context) -> bool:
+    if not ctx.guild or _is_admin(ctx.author):
+        return True
+    gs = load_guild_settings().get(str(ctx.guild.id), {})
+    if not gs.get("enabled") or not gs.get("command_channels"):
+        return True
+    return ctx.channel.id in gs["command_channels"]
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SLASH COMMANDS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1707,10 +1717,16 @@ async def on_message(message: discord.Message):
                 if COMMAND_RE.search(message.content):
                     try:
                         await message.delete()
-                    except discord.Forbidden:
+                    except discord.HTTPException:
                         pass
                 return
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
+        return
 
 
 @bot.event
