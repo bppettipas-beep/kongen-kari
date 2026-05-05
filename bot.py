@@ -1710,15 +1710,15 @@ async def on_message(message: discord.Message):
     for counter in chat_counters.values():
         if counter.get("guild_id") == guild_id and not counter.get("counting_history", False):
             counter["counts"][uid] = counter["counts"].get(uid, 0) + 1
-    if not _is_admin(message.author):
-        gs = load_guild_settings().get(str(guild_id), {})
-        if gs.get("enabled") and gs.get("command_channels"):
-            if message.channel.id not in gs["command_channels"]:
-                if COMMAND_RE.search(message.content):
-                    try:
-                        await message.delete()
-                    except discord.HTTPException:
-                        pass
+    gs = load_guild_settings().get(str(guild_id), {})
+    if gs.get("enabled") and gs.get("command_channels"):
+        if message.channel.id not in gs["command_channels"]:
+            if COMMAND_RE.search(message.content):
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
+            if not _is_admin(message.author):
                 return
     await bot.process_commands(message)
 
