@@ -1,4 +1,6 @@
 import asyncio
+import io
+import sqlite3
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -6,6 +8,7 @@ import os
 import json
 import random
 import re
+import time as _time
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
@@ -29,6 +32,11 @@ class RestrictedCommandTree(app_commands.CommandTree):
             return True
         if interaction.channel_id in settings["command_channels"]:
             return True
+        try:
+            if _tkt_by_channel(str(interaction.channel_id)):
+                return True
+        except Exception:
+            pass
         await interaction.response.send_message(
             "Commands are not allowed in this channel.", ephemeral=True
         )
@@ -43,11 +51,12 @@ GUILD_IDS = [
 ]
 GOLD     = 0xFFD700
 MEDALS   = ["🥇", "🥈", "🥉"]
-DATA_DIR = os.getenv("DATA_DIR", ".")
-LB_FILE  = os.path.join(DATA_DIR, "leaderboards.json")
-CC_FILE  = os.path.join(DATA_DIR, "chat_counters.json")
-GW_FILE  = os.path.join(DATA_DIR, "giveaways.json")
-GS_FILE  = os.path.join(DATA_DIR, "guild_settings.json")
+DATA_DIR    = os.getenv("DATA_DIR", ".")
+LB_FILE     = os.path.join(DATA_DIR, "leaderboards.json")
+CC_FILE     = os.path.join(DATA_DIR, "chat_counters.json")
+GW_FILE     = os.path.join(DATA_DIR, "giveaways.json")
+GS_FILE     = os.path.join(DATA_DIR, "guild_settings.json")
+TICKET_DB   = os.path.join(DATA_DIR, "tickets.db")
 
 COMMAND_RE = re.compile(r"^[^\w\s]\w", re.UNICODE)
 
@@ -197,12 +206,13 @@ def save_guild_settings(data: dict):
 
 # ─── In-memory state ──────────────────────────────────────────────────────────
 
-lb_sessions:        dict[str, dict] = {}
-emb_sessions:       dict[str, dict] = {}
-cc_sessions:        dict[str, dict] = {}
-chat_counters:      dict[str, dict] = {}
-currently_counting: set[str]        = set()
-giveaways:          dict[str, dict] = {}
+lb_sessions:           dict[str, dict] = {}
+emb_sessions:          dict[str, dict] = {}
+cc_sessions:           dict[str, dict] = {}
+chat_counters:         dict[str, dict] = {}
+currently_counting:    set[str]        = set()
+giveaways:             dict[str, dict] = {}
+ticket_panel_builders: dict[str, dict] = {}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -732,7 +742,7 @@ def build_cc_setup_embed(s: dict) -> discord.Embed:
             f"**Top N:** {s.get('top_n', 10)} users\n"
             f"**Medals:** {'Yes' if s.get('show_medals', True) else 'No'}\n"
             f"**Reset Every:** {reset_display}\n"
-            f"**Footer:** {s.get('footer_text', 'Kongen & Kari\'s Hangout')}"
+            "**Footer:** " + s.get('footer_text', "Kongen & Kari's Hangout")
         ),
         inline=False,
     )
@@ -1698,6 +1708,996 @@ async def giveaway_reroll_cmd(interaction: discord.Interaction, message_id: str)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  TICKET SYSTEM
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ─── DB helpers ───────────────────────────────────────────────────────────────
+
+def _tdb() -> sqlite3.Connection:
+    conn = sqlite3.connect(TICKET_DB)
+    conn.row_factory = sqlite3.Row
+    conn.isolation_level = None  # autocommit
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _init_ticket_db():
+    c = _tdb()
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS ticket_config (
+            guild_id         TEXT PRIMARY KEY,
+            category_id      TEXT,
+            log_channel_id   TEXT,
+            support_role_ids TEXT,
+            panel_channel_id TEXT,
+            panel_message_id TEXT,
+            next_ticket_num  INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS tickets (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id    TEXT NOT NULL,
+            channel_id  TEXT NOT NULL UNIQUE,
+            ticket_num  INTEGER NOT NULL,
+            owner_id    TEXT NOT NULL,
+            claimed_by  TEXT,
+            status      TEXT DEFAULT 'open',
+            reason      TEXT,
+            created_at  INTEGER DEFAULT (strftime('%s','now')),
+            closed_at   INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS ticket_questions (
+            guild_id         TEXT NOT NULL,
+            prefix           TEXT NOT NULL,
+            questions        TEXT NOT NULL DEFAULT '[]',
+            category_id      TEXT,
+            support_role_ids TEXT,
+            PRIMARY KEY (guild_id, prefix)
+        );
+    """)
+    c.close()
+
+
+_init_ticket_db()
+
+
+def _tc_get(gid: str) -> dict | None:
+    c = _tdb()
+    r = c.execute("SELECT * FROM ticket_config WHERE guild_id=?", (gid,)).fetchone()
+    c.close()
+    return dict(r) if r else None
+
+
+def _tc_upsert(gid: str, **kw):
+    ex = _tc_get(gid) or {}
+    m  = {**ex, **kw, "guild_id": gid}
+    c  = _tdb()
+    c.execute("""
+        INSERT INTO ticket_config
+            (guild_id,category_id,log_channel_id,support_role_ids,panel_channel_id,panel_message_id,next_ticket_num)
+        VALUES
+            (:guild_id,:category_id,:log_channel_id,:support_role_ids,:panel_channel_id,:panel_message_id,:next_ticket_num)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            category_id=excluded.category_id, log_channel_id=excluded.log_channel_id,
+            support_role_ids=excluded.support_role_ids, panel_channel_id=excluded.panel_channel_id,
+            panel_message_id=excluded.panel_message_id, next_ticket_num=excluded.next_ticket_num
+    """, {"guild_id": gid, "category_id": m.get("category_id"), "log_channel_id": m.get("log_channel_id"),
+          "support_role_ids": m.get("support_role_ids"), "panel_channel_id": m.get("panel_channel_id"),
+          "panel_message_id": m.get("panel_message_id"), "next_ticket_num": m.get("next_ticket_num", 1)})
+    c.close()
+
+
+def _tc_bump(gid: str):
+    c = _tdb()
+    c.execute("UPDATE ticket_config SET next_ticket_num=next_ticket_num+1 WHERE guild_id=?", (gid,))
+    c.close()
+
+
+def _tq_get(gid: str, prefix: str) -> dict | None:
+    c = _tdb()
+    r = c.execute("SELECT * FROM ticket_questions WHERE guild_id=? AND prefix=?", (gid, prefix)).fetchone()
+    c.close()
+    return dict(r) if r else None
+
+
+def _tq_all(gid: str) -> list[dict]:
+    c = _tdb()
+    rows = c.execute("SELECT * FROM ticket_questions WHERE guild_id=?", (gid,)).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def _tq_upsert(gid: str, prefix: str, questions: str, category_id: str | None, support_role_ids: str | None):
+    c = _tdb()
+    c.execute("""
+        INSERT INTO ticket_questions (guild_id,prefix,questions,category_id,support_role_ids)
+        VALUES (?,?,?,?,?)
+        ON CONFLICT(guild_id,prefix) DO UPDATE SET
+            questions=excluded.questions,category_id=excluded.category_id,support_role_ids=excluded.support_role_ids
+    """, (gid, prefix, questions, category_id, support_role_ids))
+    c.close()
+
+
+def _tkt_create(gid: str, channel_id: str, num: int, owner_id: str, reason: str | None) -> int:
+    c   = _tdb()
+    cur = c.execute(
+        "INSERT INTO tickets (guild_id,channel_id,ticket_num,owner_id,reason) VALUES (?,?,?,?,?)",
+        (gid, channel_id, num, owner_id, reason),
+    )
+    row_id = cur.lastrowid
+    c.close()
+    return row_id
+
+
+def _tkt_by_channel(channel_id: str) -> dict | None:
+    c = _tdb()
+    r = c.execute("SELECT * FROM tickets WHERE channel_id=?", (str(channel_id),)).fetchone()
+    c.close()
+    return dict(r) if r else None
+
+
+def _tkt_by_id(ticket_id: int) -> dict | None:
+    c = _tdb()
+    r = c.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+    c.close()
+    return dict(r) if r else None
+
+
+def _tkt_open(gid: str) -> list[dict]:
+    c    = _tdb()
+    rows = c.execute("SELECT * FROM tickets WHERE guild_id=? AND status='open'", (gid,)).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def _tkt_update(ticket_id: int, status: str, claimed_by: str | None, closed_at: int | None):
+    c = _tdb()
+    c.execute("UPDATE tickets SET status=?,claimed_by=?,closed_at=? WHERE id=?",
+              (status, claimed_by, closed_at, ticket_id))
+    c.close()
+
+
+def _support_role_ids(cfg: dict | None) -> list[str]:
+    if not cfg:
+        return []
+    if cfg.get("support_role_ids"):
+        try:
+            return json.loads(cfg["support_role_ids"])
+        except Exception:
+            pass
+    return []
+
+
+# ─── Transcript + close ───────────────────────────────────────────────────────
+
+async def _gen_transcript(channel: discord.TextChannel, ticket: dict, cfg: dict | None, client: discord.Client):
+    if not cfg or not cfg.get("log_channel_id"):
+        return
+    try:
+        log_ch = client.get_channel(int(cfg["log_channel_id"])) or await client.fetch_channel(int(cfg["log_channel_id"]))
+    except Exception:
+        return
+    try:
+        msgs = [m async for m in channel.history(limit=100, oldest_first=True)]
+    except Exception:
+        return
+    lines = []
+    for m in msgs:
+        ts     = m.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        author = f"[BOT] {m.author.name}" if m.author.bot else f"{m.author.name} ({m.author.id})"
+        parts  = []
+        if m.content:
+            parts.append(m.content)
+        for e in m.embeds:
+            ep = []
+            if e.title:       ep.append(f"[Embed: {e.title}]")
+            if e.description: ep.append(e.description[:300])
+            parts.append(" — ".join(ep) or "[Embed]")
+        if m.attachments:
+            parts.append(f"[{len(m.attachments)} attachment(s)]")
+        lines.append(f"[{ts}] {author}: {' | '.join(parts) or '[no content]'}")
+    header = (
+        f"Ticket #{ticket['ticket_num']} — Transcript\n" + "=" * 60 + "\n"
+        f"Opened by : {ticket['owner_id']}\n"
+        f"Channel   : {channel.name}\n"
+        f"Generated : {datetime.now(timezone.utc).isoformat()}\n" + "=" * 60 + "\n\n"
+    )
+    log_e = discord.Embed(color=0xED4245, title="🎫 Ticket Closed", timestamp=datetime.now(timezone.utc))
+    log_e.add_field(name="Ticket #",   value=str(ticket["ticket_num"]), inline=True)
+    log_e.add_field(name="Opened by", value=f"<@{ticket['owner_id']}>", inline=True)
+    log_e.add_field(name="Messages",  value=str(len(lines)),             inline=True)
+    log_e.set_footer(text="Transcript attached below")
+    try:
+        data = (header + "\n".join(lines)).encode("utf-8")
+        await log_ch.send(
+            embeds=[log_e],
+            files=[discord.File(fp=io.BytesIO(data), filename=f"ticket-{ticket['ticket_num']}-transcript.txt")],
+        )
+    except Exception as err:
+        print(f"[Transcript] {err}")
+
+
+async def _close_ticket(interaction: discord.Interaction, ticket: dict, cfg: dict | None):
+    _tkt_update(ticket["id"], "closed", ticket.get("claimed_by"), int(_time.time()))
+    await _gen_transcript(interaction.channel, ticket, cfg, interaction.client)
+    close_e = discord.Embed(color=0x5865F2, title="ℹ️ Ticket Closed",
+                            description="This channel will be deleted in 5 seconds.")
+    await interaction.followup.send(embed=close_e)
+    await asyncio.sleep(5)
+    try:
+        await interaction.channel.delete()
+    except Exception as err:
+        print(f"[Ticket Delete] {err}")
+
+
+# ─── Panel builder helpers ────────────────────────────────────────────────────
+
+_PANEL_STYLES = {
+    "blue":  discord.ButtonStyle.primary,
+    "green": discord.ButtonStyle.success,
+    "red":   discord.ButtonStyle.danger,
+    "grey":  discord.ButtonStyle.secondary,
+}
+_PANEL_STYLE_LABEL = {"blue": "Blue", "green": "Green", "red": "Red", "grey": "Grey"}
+
+
+def _panel_preview_embed(cfg: dict) -> discord.Embed:
+    e = discord.Embed(color=cfg.get("color", 0xF4A460),
+                      title=cfg.get("title", ""),
+                      description=cfg.get("description", ""))
+    e.set_footer(text="Panel Preview")
+    return e
+
+
+def _panel_config_embed(cfg: dict) -> discord.Embed:
+    buttons = cfg.get("buttons", [])
+    if buttons:
+        lines = []
+        for i, b in enumerate(buttons):
+            sl    = _PANEL_STYLE_LABEL.get(b.get("style", ""), "Blue")
+            em    = f"{b['emoji']} " if b.get("emoji") else ""
+            qn    = f" · {len(b.get('questions', []))}Q" if b.get("questions") else ""
+            cn    = " · 📁" if b.get("category_id") else ""
+            rn    = f" · 🛡️({len(b['support_role_ids'])})" if b.get("support_role_ids") else ""
+            lines.append(f"**{i+1}.** {em}**{b['label']}** ({sl}) → `{b.get('prefix','ticket')}-####`{qn}{cn}{rn}")
+        btn_val = "\n".join(lines)
+    else:
+        btn_val = "*No buttons added yet — click ➕ Add Button*"
+    role_ids   = cfg.get("support_role_ids", [])
+    roles_val  = " ".join(f"<@&{r}>" for r in role_ids) if role_ids else "❌ Not set"
+    e = discord.Embed(color=0x5865F2, title="⚙️ Panel Configuration")
+    e.add_field(name="📁 Ticket Category", value=f"<#{cfg['category_id']}>" if cfg.get("category_id") else "❌ Not set", inline=True)
+    e.add_field(name="📋 Log Channel",     value=f"<#{cfg['log_channel_id']}>" if cfg.get("log_channel_id") else "❌ Not set", inline=True)
+    e.add_field(name=f"🛡️ Support Roles ({len(role_ids)})", value=roles_val, inline=False)
+    e.add_field(name=f"🔘 Buttons ({len(buttons)}/5)", value=btn_val, inline=False)
+    e.set_footer(text="Category, log channel, at least one support role, and one button must be set.")
+    return e
+
+
+def _btn_config_embed(cfg: dict, idx: int) -> discord.Embed:
+    b       = cfg["buttons"][idx]
+    cat_v   = f"<#{b['category_id']}>" if b.get("category_id") else "*(uses panel default)*"
+    rids    = b.get("support_role_ids", [])
+    role_v  = " ".join(f"<@&{r}>" for r in rids) if rids else "*(uses panel defaults)*"
+    e = discord.Embed(color=0x5865F2, title=f"⚙️ Configure: {b['label']}")
+    e.description = "Set a **specific category and support roles** for this ticket type.\nLeave unset to inherit the panel's global defaults."
+    e.add_field(name="📁 Category",      value=cat_v,  inline=True)
+    e.add_field(name="🛡️ Support Roles", value=role_v, inline=True)
+    return e
+
+
+# ─── Persistent ticket views ──────────────────────────────────────────────────
+
+class TicketChannelView(discord.ui.View):
+    def __init__(self, ticket_id: int):
+        super().__init__(timeout=None)
+        claim_btn = discord.ui.Button(
+            label="Claim", emoji="🙋", style=discord.ButtonStyle.secondary,
+            custom_id=f"ticket_claim:{ticket_id}",
+        )
+        close_btn = discord.ui.Button(
+            label="Close", emoji="🔒", style=discord.ButtonStyle.danger,
+            custom_id=f"ticket_close:{ticket_id}",
+        )
+
+        async def _claim(interaction: discord.Interaction):
+            t   = _tkt_by_id(ticket_id)
+            cfg = _tc_get(str(interaction.guild_id))
+            if not t or t["status"] != "open":
+                return await interaction.response.send_message(
+                    embed=discord.Embed(color=0xED4245, title="❌ Ticket not found",
+                                        description="This ticket could not be found or is already closed."),
+                    ephemeral=True)
+            roles = _support_role_ids(cfg)
+            if not any(interaction.user.get_role(int(r)) for r in roles):  # type: ignore[union-attr]
+                return await interaction.response.send_message(
+                    embed=discord.Embed(color=0xED4245, title="❌ Permission denied",
+                                        description="Only support staff can claim tickets."),
+                    ephemeral=True)
+            _tkt_update(ticket_id, "open", str(interaction.user.id), None)
+            await interaction.response.send_message(
+                embed=discord.Embed(color=0x5865F2, title="ℹ️ Ticket Claimed",
+                                    description=f"{interaction.user.mention} has claimed this ticket."))
+
+        async def _close(interaction: discord.Interaction):
+            t   = _tkt_by_id(ticket_id)
+            cfg = _tc_get(str(interaction.guild_id))
+            if not t or t["status"] != "open":
+                return await interaction.response.send_message(
+                    embed=discord.Embed(color=0xED4245, title="❌ Ticket not found",
+                                        description="This ticket could not be found or is already closed."),
+                    ephemeral=True)
+            roles    = _support_role_ids(cfg)
+            can_close = (
+                str(interaction.user.id) == t["owner_id"]
+                or any(interaction.user.get_role(int(r)) for r in roles)  # type: ignore[union-attr]
+                or interaction.user.guild_permissions.manage_channels       # type: ignore[union-attr]
+            )
+            if not can_close:
+                return await interaction.response.send_message(
+                    embed=discord.Embed(color=0xED4245, title="❌ Permission denied",
+                                        description="Only the ticket owner or staff can close this."),
+                    ephemeral=True)
+            await interaction.response.defer()
+            await _close_ticket(interaction, t, cfg)
+
+        claim_btn.callback = _claim
+        close_btn.callback = _close
+        self.add_item(claim_btn)
+        self.add_item(close_btn)
+
+
+def _make_panel_listener(prefixes: list[str]) -> discord.ui.View:
+    v = discord.ui.View(timeout=None)
+    for prefix in prefixes:
+        btn = discord.ui.Button(label="Open Ticket", custom_id=f"ticket_create:{prefix}",
+                                style=discord.ButtonStyle.primary)
+        async def _cb(interaction: discord.Interaction, pfx: str = prefix):
+            await _handle_ticket_create(interaction, pfx)
+        btn.callback = _cb
+        v.add_item(btn)
+    return v
+
+
+# ─── Panel builder views ──────────────────────────────────────────────────────
+
+class BtnConfigView(discord.ui.View):
+    def __init__(self, user_id: str, idx: int):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.idx     = idx
+        self._populate()
+
+    def _cfg(self):  return ticket_panel_builders.get(self.user_id, {})
+    def _btn(self):  return self._cfg().get("buttons", [])[self.idx]
+
+    def _populate(self):
+        self.clear_items()
+        cfg = self._cfg()
+        btn = self._btn()
+
+        cat = discord.ui.ChannelSelect(
+            placeholder="✅ Category set — click to change" if btn.get("category_id") else "📁 Select category for this ticket type...",
+            channel_types=[discord.ChannelType.category], row=0,
+        )
+        async def _on_cat(interaction: discord.Interaction):
+            cfg2 = self._cfg()
+            cfg2["buttons"][self.idx]["category_id"] = str(cat.values[0].id)
+            ticket_panel_builders[self.user_id] = cfg2
+            v = BtnConfigView(self.user_id, self.idx)
+            await interaction.response.edit_message(embeds=[_btn_config_embed(cfg2, self.idx)], view=v)
+        cat.callback = _on_cat
+        self.add_item(cat)
+
+        role = discord.ui.RoleSelect(
+            placeholder="✅ Roles set — select to replace" if btn.get("support_role_ids") else "🛡️ Select support roles for this ticket type...",
+            min_values=1, max_values=10, row=1,
+        )
+        async def _on_role(interaction: discord.Interaction):
+            cfg2 = self._cfg()
+            cfg2["buttons"][self.idx]["support_role_ids"] = [str(r.id) for r in role.values]
+            ticket_panel_builders[self.user_id] = cfg2
+            v = BtnConfigView(self.user_id, self.idx)
+            await interaction.response.edit_message(embeds=[_btn_config_embed(cfg2, self.idx)], view=v)
+        role.callback = _on_role
+        self.add_item(role)
+
+        done = discord.ui.Button(label="Done", emoji="✅", style=discord.ButtonStyle.success, row=2)
+        async def _on_done(interaction: discord.Interaction):
+            cfg2 = self._cfg()
+            v    = PanelBuilderView(self.user_id)
+            await interaction.response.edit_message(
+                embeds=[_panel_preview_embed(cfg2), _panel_config_embed(cfg2)], view=v)
+        done.callback = _on_done
+        self.add_item(done)
+
+        if btn.get("category_id"):
+            clr_cat = discord.ui.Button(label="Clear Category", style=discord.ButtonStyle.secondary, row=2)
+            async def _on_clr_cat(interaction: discord.Interaction):
+                cfg2 = self._cfg()
+                cfg2["buttons"][self.idx]["category_id"] = None
+                ticket_panel_builders[self.user_id] = cfg2
+                v = BtnConfigView(self.user_id, self.idx)
+                await interaction.response.edit_message(embeds=[_btn_config_embed(cfg2, self.idx)], view=v)
+            clr_cat.callback = _on_clr_cat
+            self.add_item(clr_cat)
+
+        if btn.get("support_role_ids"):
+            clr_roles = discord.ui.Button(label="Clear Roles", style=discord.ButtonStyle.secondary, row=2)
+            async def _on_clr_roles(interaction: discord.Interaction):
+                cfg2 = self._cfg()
+                cfg2["buttons"][self.idx]["support_role_ids"] = []
+                ticket_panel_builders[self.user_id] = cfg2
+                v = BtnConfigView(self.user_id, self.idx)
+                await interaction.response.edit_message(embeds=[_btn_config_embed(cfg2, self.idx)], view=v)
+            clr_roles.callback = _on_clr_roles
+            self.add_item(clr_roles)
+
+
+class PanelBuilderView(discord.ui.View):
+    def __init__(self, user_id: str):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self._populate()
+
+    def _cfg(self): return ticket_panel_builders.get(self.user_id, {})
+
+    def _populate(self):
+        self.clear_items()
+        cfg     = self._cfg()
+        buttons = cfg.get("buttons", [])
+
+        cat = discord.ui.ChannelSelect(
+            placeholder="✅ Category set — click to change" if cfg.get("category_id") else "📁 Select ticket category...",
+            channel_types=[discord.ChannelType.category], row=0,
+        )
+        async def _on_cat(interaction: discord.Interaction):
+            cfg2 = self._cfg(); cfg2["category_id"] = str(cat.values[0].id)
+            ticket_panel_builders[self.user_id] = cfg2
+            v = PanelBuilderView(self.user_id)
+            await interaction.response.edit_message(embeds=[_panel_preview_embed(cfg2), _panel_config_embed(cfg2)], view=v)
+        cat.callback = _on_cat
+        self.add_item(cat)
+
+        log = discord.ui.ChannelSelect(
+            placeholder="✅ Log channel set — click to change" if cfg.get("log_channel_id") else "📋 Select log channel...",
+            channel_types=[discord.ChannelType.text], row=1,
+        )
+        async def _on_log(interaction: discord.Interaction):
+            cfg2 = self._cfg(); cfg2["log_channel_id"] = str(log.values[0].id)
+            ticket_panel_builders[self.user_id] = cfg2
+            v = PanelBuilderView(self.user_id)
+            await interaction.response.edit_message(embeds=[_panel_preview_embed(cfg2), _panel_config_embed(cfg2)], view=v)
+        log.callback = _on_log
+        self.add_item(log)
+
+        role = discord.ui.RoleSelect(
+            placeholder="✅ Roles set — select again to replace" if cfg.get("support_role_ids") else "🛡️ Select support roles...",
+            min_values=1, max_values=10, row=2,
+        )
+        async def _on_role(interaction: discord.Interaction):
+            cfg2 = self._cfg(); cfg2["support_role_ids"] = [str(r.id) for r in role.values]
+            ticket_panel_builders[self.user_id] = cfg2
+            v = PanelBuilderView(self.user_id)
+            await interaction.response.edit_message(embeds=[_panel_preview_embed(cfg2), _panel_config_embed(cfg2)], view=v)
+        role.callback = _on_role
+        self.add_item(role)
+
+        if buttons:
+            edit_sel = discord.ui.Select(
+                placeholder="✏️ Select a button to edit...",
+                options=[
+                    discord.SelectOption(
+                        label=(b["label"] or f"Button {i+1}")[:100],
+                        value=str(i),
+                        description=f"prefix: {b.get('prefix','ticket')} · {len(b.get('questions',[]))} question(s)",
+                    ) for i, b in enumerate(buttons)
+                ], row=3,
+            )
+            async def _on_edit_sel(interaction: discord.Interaction):
+                await interaction.response.send_modal(EditButtonModal(self.user_id, int(edit_sel.values[0])))
+            edit_sel.callback = _on_edit_sel
+            self.add_item(edit_sel)
+
+        ready = bool(cfg.get("category_id") and cfg.get("log_channel_id") and cfg.get("support_role_ids") and buttons)
+
+        add_btn = discord.ui.Button(label="Add Button", emoji="➕", style=discord.ButtonStyle.primary, row=4, disabled=len(buttons) >= 5)
+        async def _on_add(interaction: discord.Interaction):
+            await interaction.response.send_modal(AddButtonModal(self.user_id))
+        add_btn.callback = _on_add
+        self.add_item(add_btn)
+
+        rm_btn = discord.ui.Button(label="Remove Last", emoji="↩️", style=discord.ButtonStyle.secondary, row=4, disabled=not buttons)
+        async def _on_rm(interaction: discord.Interaction):
+            cfg2 = self._cfg(); cfg2["buttons"].pop()
+            ticket_panel_builders[self.user_id] = cfg2
+            v = PanelBuilderView(self.user_id)
+            await interaction.response.edit_message(embeds=[_panel_preview_embed(cfg2), _panel_config_embed(cfg2)], view=v)
+        rm_btn.callback = _on_rm
+        self.add_item(rm_btn)
+
+        edit_text = discord.ui.Button(label="Edit Text", emoji="✏️", style=discord.ButtonStyle.secondary, row=4)
+        async def _on_edit_text(interaction: discord.Interaction):
+            await interaction.response.send_modal(EditPanelTextModal(self.user_id))
+        edit_text.callback = _on_edit_text
+        self.add_item(edit_text)
+
+        post_btn = discord.ui.Button(label="Post Panel", emoji="✅", style=discord.ButtonStyle.success, row=4, disabled=not ready)
+        async def _on_post(interaction: discord.Interaction):
+            await _post_ticket_panel(interaction, self.user_id)
+        post_btn.callback = _on_post
+        self.add_item(post_btn)
+
+        cancel_btn = discord.ui.Button(label="Cancel", emoji="🗑️", style=discord.ButtonStyle.danger, row=4)
+        async def _on_cancel(interaction: discord.Interaction):
+            ticket_panel_builders.pop(self.user_id, None)
+            await interaction.response.edit_message(
+                embeds=[discord.Embed(color=0x5865F2, title="Cancelled", description="Panel builder closed.")], view=None)
+        cancel_btn.callback = _on_cancel
+        self.add_item(cancel_btn)
+
+
+# ─── Ticket + panel modals ────────────────────────────────────────────────────
+
+def _parse_hex_color(raw: str) -> int:
+    try:
+        return int(raw.strip().replace("#", ""), 16)
+    except Exception:
+        return 0xF4A460
+
+
+def _parse_questions(raw: str) -> list[dict]:
+    qs = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        qs.append({"label": line[1:].strip() if line.startswith("*") else line, "required": not line.startswith("*")})
+    return qs[:5]
+
+
+class TicketPanelInitModal(discord.ui.Modal, title="Ticket Panel Builder"):
+    panel_title = discord.ui.TextInput(label="Panel Title", max_length=100, required=True)
+    description = discord.ui.TextInput(label="Panel Description", style=discord.TextStyle.paragraph, max_length=2000, required=True)
+    color       = discord.ui.TextInput(label="Embed Color (hex, e.g. F4A460)", max_length=7, required=False, default="F4A460")
+
+    def __init__(self, channel_id: str):
+        super().__init__()
+        self._channel_id = channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid    = str(interaction.user.id)
+        ex     = ticket_panel_builders.get(uid, {})
+        config = {
+            "channel_id": self._channel_id, "edit_message_id": None,
+            "title": self.panel_title.value.strip(), "description": self.description.value.strip(),
+            "color": _parse_hex_color(self.color.value),
+            "category_id": ex.get("category_id"), "log_channel_id": ex.get("log_channel_id"),
+            "support_role_ids": ex.get("support_role_ids", []), "buttons": ex.get("buttons", []),
+        }
+        ticket_panel_builders[uid] = config
+        v = PanelBuilderView(uid)
+        await interaction.response.send_message(
+            embeds=[_panel_preview_embed(config), _panel_config_embed(config)], view=v, ephemeral=True)
+
+
+class EditPanelTextModal(discord.ui.Modal, title="Edit Panel Text"):
+    panel_title = discord.ui.TextInput(label="Panel Title", max_length=100, required=True)
+    description = discord.ui.TextInput(label="Panel Description", style=discord.TextStyle.paragraph, max_length=2000, required=True)
+    color       = discord.ui.TextInput(label="Embed Color (hex, e.g. F4A460)", max_length=7, required=False)
+
+    def __init__(self, user_id: str):
+        super().__init__()
+        self._uid = user_id
+        cfg = ticket_panel_builders.get(user_id, {})
+        self.panel_title.default = cfg.get("title", "")
+        self.description.default = cfg.get("description", "")
+        self.color.default       = f"{cfg.get('color', 0xF4A460):06X}"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cfg = ticket_panel_builders.get(self._uid, {})
+        cfg["title"]       = self.panel_title.value.strip()
+        cfg["description"] = self.description.value.strip()
+        if self.color.value.strip():
+            cfg["color"] = _parse_hex_color(self.color.value)
+        ticket_panel_builders[self._uid] = cfg
+        v = PanelBuilderView(self._uid)
+        await interaction.response.edit_message(
+            embeds=[_panel_preview_embed(cfg), _panel_config_embed(cfg)], view=v)
+
+
+class AddButtonModal(discord.ui.Modal, title="Add Ticket Button"):
+    btn_label     = discord.ui.TextInput(label="Button Label", max_length=80, required=True)
+    btn_emoji     = discord.ui.TextInput(label="Emoji (optional)", max_length=10, required=False)
+    btn_prefix    = discord.ui.TextInput(label="Ticket Name Prefix", max_length=20, required=False, placeholder="e.g. support → channel: support-0001")
+    btn_style     = discord.ui.TextInput(label="Button Color (blue / green / red / grey)", max_length=10, required=False, placeholder="blue")
+    btn_questions = discord.ui.TextInput(label="Questions (one per line, * = optional)", style=discord.TextStyle.paragraph, max_length=500, required=False, placeholder="Are you buying or selling?\nHow many units?\n*Any notes?")
+
+    def __init__(self, user_id: str):
+        super().__init__()
+        self._uid = user_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cfg = ticket_panel_builders.get(self._uid)
+        if not cfg:
+            return await interaction.response.send_message("Session expired. Run `/ticket panel` again.", ephemeral=True)
+        prefix = re.sub(r"\s+", "-", self.btn_prefix.value.strip().lower()) or "ticket"
+        cfg["buttons"].append({
+            "label": self.btn_label.value.strip(), "emoji": self.btn_emoji.value.strip(),
+            "style": self.btn_style.value.strip().lower(), "prefix": prefix,
+            "questions": _parse_questions(self.btn_questions.value),
+            "category_id": None, "support_role_ids": [],
+        })
+        ticket_panel_builders[self._uid] = cfg
+        idx = len(cfg["buttons"]) - 1
+        await interaction.response.edit_message(embeds=[_btn_config_embed(cfg, idx)], view=BtnConfigView(self._uid, idx))
+
+
+class EditButtonModal(discord.ui.Modal, title="Edit Ticket Button"):
+    btn_label     = discord.ui.TextInput(label="Button Label", max_length=80, required=True)
+    btn_emoji     = discord.ui.TextInput(label="Emoji (optional)", max_length=10, required=False)
+    btn_prefix    = discord.ui.TextInput(label="Ticket Name Prefix", max_length=20, required=False)
+    btn_style     = discord.ui.TextInput(label="Button Color (blue / green / red / grey)", max_length=10, required=False)
+    btn_questions = discord.ui.TextInput(label="Questions (one per line, * = optional)", style=discord.TextStyle.paragraph, max_length=500, required=False)
+
+    def __init__(self, user_id: str, idx: int):
+        super().__init__()
+        self._uid = user_id
+        self._idx = idx
+        cfg = ticket_panel_builders.get(user_id, {})
+        if cfg.get("buttons") and idx < len(cfg["buttons"]):
+            b = cfg["buttons"][idx]
+            self.btn_label.default     = b.get("label", "")
+            self.btn_emoji.default     = b.get("emoji", "")
+            self.btn_prefix.default    = b.get("prefix", "ticket")
+            self.btn_style.default     = b.get("style", "blue")
+            self.btn_questions.default = "\n".join(
+                ("*" if not q["required"] else "") + q["label"]
+                for q in b.get("questions", [])
+            )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cfg = ticket_panel_builders.get(self._uid)
+        if not cfg or self._idx >= len(cfg.get("buttons", [])):
+            return await interaction.response.send_message("Session expired. Run `/ticket panel` again.", ephemeral=True)
+        prefix = re.sub(r"\s+", "-", self.btn_prefix.value.strip().lower()) or "ticket"
+        b      = cfg["buttons"][self._idx]
+        cfg["buttons"][self._idx] = {
+            "label": self.btn_label.value.strip(), "emoji": self.btn_emoji.value.strip(),
+            "style": self.btn_style.value.strip().lower(), "prefix": prefix,
+            "questions": _parse_questions(self.btn_questions.value),
+            "category_id": b.get("category_id"), "support_role_ids": b.get("support_role_ids", []),
+        }
+        ticket_panel_builders[self._uid] = cfg
+        await interaction.response.edit_message(embeds=[_btn_config_embed(cfg, self._idx)], view=BtnConfigView(self._uid, self._idx))
+
+
+class TicketQsFormModal(discord.ui.Modal):
+    def __init__(self, prefix: str, questions: list[dict]):
+        type_name = prefix.replace("-", " ").title()
+        super().__init__(title=f"{type_name} — Open a Ticket")
+        self._prefix    = prefix
+        self._questions = questions
+        for i, q in enumerate(questions[:5]):
+            is_para = bool(re.search(r"explain|describe|proof|detail|reason|issue|problem", q["label"], re.I))
+            self.add_item(discord.ui.TextInput(
+                custom_id=f"q{i}", label=q["label"][:45],
+                style=discord.TextStyle.paragraph if is_para else discord.TextStyle.short,
+                required=q.get("required", True), max_length=500,
+            ))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = [
+            {"question": q["label"], "answer": self.children[i].value}
+            for i, q in enumerate(self._questions[:5])
+        ]
+        await _create_ticket_channel(interaction, self._prefix, answers)
+
+
+class EditMessageModal(discord.ui.Modal, title="Edit Message"):
+    msg_title = discord.ui.TextInput(label="Embed Title", max_length=256, required=False)
+    msg_body  = discord.ui.TextInput(label="Embed Description / Message Content", style=discord.TextStyle.paragraph, max_length=4000, required=False)
+
+    def __init__(self, message: discord.Message):
+        super().__init__()
+        self._msg = message
+        if message.embeds:
+            self.msg_title.default = message.embeds[0].title or ""
+            self.msg_body.default  = (message.embeds[0].description or "")[:4000]
+        else:
+            self.msg_body.default  = message.content[:4000] if message.content else ""
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_title = self.msg_title.value.strip()
+        new_body  = self.msg_body.value.strip()
+        if self._msg.embeds:
+            updated = discord.Embed.from_dict(self._msg.embeds[0].to_dict())
+            updated.title       = new_title or None
+            updated.description = new_body  or None
+            await self._msg.edit(embeds=[updated])
+        else:
+            await self._msg.edit(content=new_body or None)
+        await interaction.response.send_message(
+            embed=discord.Embed(color=0x57F287, title="✅ Message Updated", description="The message has been edited."),
+            ephemeral=True)
+
+
+# ─── Ticket creation ──────────────────────────────────────────────────────────
+
+async def _handle_ticket_create(interaction: discord.Interaction, prefix: str):
+    gid    = str(interaction.guild_id)
+    cfg    = _tc_get(gid)
+    btn_cfg = _tq_get(gid, prefix)
+    if not btn_cfg and not cfg:
+        return await interaction.response.send_message(
+            embed=discord.Embed(color=0xED4245, title="❌ Not configured",
+                                description="No ticket panel has been set up yet."), ephemeral=True)
+    existing = next((t for t in _tkt_open(gid) if t["owner_id"] == str(interaction.user.id)), None)
+    if existing:
+        return await interaction.response.send_message(
+            embed=discord.Embed(color=0xFEE75C, title="⚠️ Already open",
+                                description=f"You already have a ticket open: <#{existing['channel_id']}>"), ephemeral=True)
+    q_list = json.loads(btn_cfg["questions"]) if btn_cfg and btn_cfg.get("questions") else []
+    if q_list:
+        return await interaction.response.send_modal(TicketQsFormModal(prefix, q_list))
+    await _create_ticket_channel(interaction, prefix, [])
+
+
+async def _create_ticket_channel(interaction: discord.Interaction, prefix: str, answers: list[dict]):
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    gid      = str(interaction.guild_id)
+    cfg      = _tc_get(gid)
+    btn_cfg  = _tq_get(gid, prefix)
+    cat_id   = (btn_cfg.get("category_id") if btn_cfg else None) or (cfg.get("category_id") if cfg else None)
+    if not cat_id:
+        return await interaction.followup.send(
+            embed=discord.Embed(color=0xED4245, title="❌ Not configured",
+                                description="No ticket panel has been set up yet."), ephemeral=True)
+    if btn_cfg and btn_cfg.get("support_role_ids"):
+        try:
+            role_ids = json.loads(btn_cfg["support_role_ids"])
+        except Exception:
+            role_ids = []
+    else:
+        role_ids = _support_role_ids(cfg)
+    existing = next((t for t in _tkt_open(gid) if t["owner_id"] == str(interaction.user.id)), None)
+    if existing:
+        return await interaction.followup.send(
+            embed=discord.Embed(color=0xFEE75C, title="⚠️ Already open",
+                                description=f"You already have a ticket open: <#{existing['channel_id']}>"), ephemeral=True)
+    type_name = prefix.replace("-", " ").title()
+    num       = (cfg or {}).get("next_ticket_num", 1)
+    guild     = interaction.guild
+    safe_name = re.sub(r"[^a-z0-9_-]", "-", interaction.user.name.lower())
+    safe_name = re.sub(r"-{2,}", "-", safe_name).strip("-")[:25] or "user"
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user:   discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+    }
+    for rid in role_ids:
+        role_obj = guild.get_role(int(rid))
+        if role_obj:
+            overwrites[role_obj] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    channel = await guild.create_text_channel(
+        name=f"{prefix}-{safe_name}",
+        category=guild.get_channel(int(cat_id)),
+        overwrites=overwrites,
+    )
+    ticket_id = _tkt_create(gid, str(channel.id), num, str(interaction.user.id),
+                            "\n".join(f"{a['question']}: {a['answer']}" for a in answers) if answers else None)
+    _tc_bump(gid)
+    display = interaction.user.display_name
+    greet   = discord.Embed(color=0xF4A460, title=f"🎫 {type_name} — {display}",
+                            description=f"Hello {interaction.user.mention}! Support staff will be with you shortly.",
+                            timestamp=datetime.now(timezone.utc))
+    greet.set_footer(text="Use /ticket close to close this ticket.")
+    if answers:
+        for a in answers:
+            greet.add_field(name=a["question"], value=a["answer"] or "—", inline=False)
+    view = TicketChannelView(ticket_id)
+    bot.add_view(view)
+    ping = f"{interaction.user.mention} " + " ".join(f"<@&{r}>" for r in role_ids) if role_ids else interaction.user.mention
+    await channel.send(content=ping, embeds=[greet], view=view)
+    if cfg and cfg.get("log_channel_id"):
+        try:
+            log_ch = interaction.client.get_channel(int(cfg["log_channel_id"])) or \
+                     await interaction.client.fetch_channel(int(cfg["log_channel_id"]))
+            log_e  = discord.Embed(color=0x57F287, title=f"{type_name} Ticket Opened",
+                                   timestamp=datetime.now(timezone.utc))
+            log_e.add_field(name="User",    value=f"{interaction.user.mention} ({interaction.user.id})", inline=True)
+            log_e.add_field(name="Channel", value=f"<#{channel.id}>",                                   inline=True)
+            log_e.add_field(name="Type",    value=type_name,                                            inline=True)
+            if answers:
+                for a in answers:
+                    log_e.add_field(name=a["question"], value=a["answer"] or "—", inline=False)
+            await log_ch.send(embeds=[log_e])
+        except Exception:
+            pass
+    await interaction.followup.send(
+        embed=discord.Embed(color=0x57F287, title="✅ Ticket Created",
+                            description=f"Your ticket is open in {channel.mention}."), ephemeral=True)
+
+
+# ─── Post panel ───────────────────────────────────────────────────────────────
+
+async def _post_ticket_panel(interaction: discord.Interaction, user_id: str):
+    cfg = ticket_panel_builders.get(user_id)
+    if not cfg:
+        return await interaction.response.send_message("Session expired. Run `/ticket panel` again.", ephemeral=True)
+    if not cfg.get("buttons"):
+        return await interaction.response.send_message("Add at least one button before posting.", ephemeral=True)
+    if not cfg.get("edit_message_id") and not (cfg.get("category_id") and cfg.get("log_channel_id") and cfg.get("support_role_ids")):
+        return await interaction.response.send_message("Fill in category, log channel, and at least one support role.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=False)
+    try:
+        channel = interaction.client.get_channel(int(cfg["channel_id"])) or \
+                  await interaction.client.fetch_channel(int(cfg["channel_id"]))
+    except Exception:
+        return await interaction.followup.send("Target channel not found.", ephemeral=True)
+    panel_embed = discord.Embed(color=cfg.get("color", 0xF4A460), title=cfg["title"], description=cfg["description"])
+    panel_embed.set_footer(text="Kongen & Kari's Helper • Ticket System")
+    btn_components = []
+    for b in cfg["buttons"]:
+        style = _PANEL_STYLES.get(b.get("style", ""), discord.ButtonStyle.primary)
+        btn   = discord.ui.Button(label=b["label"], style=style, custom_id=f"ticket_create:{b['prefix']}")
+        if b.get("emoji"):
+            try:
+                btn.emoji = b["emoji"]
+            except Exception:
+                pass
+        btn_components.append(btn)
+    panel_view = discord.ui.View(timeout=None)
+    for bc in btn_components:
+        panel_view.add_item(bc)
+    payload = {"embeds": [panel_embed], "view": panel_view}
+    if cfg.get("edit_message_id"):
+        try:
+            existing_msg = await channel.fetch_message(int(cfg["edit_message_id"]))
+            await existing_msg.edit(**payload)
+            panel_msg_id = cfg["edit_message_id"]
+        except Exception:
+            return await interaction.followup.send("Original message not found — it may have been deleted.", ephemeral=True)
+    else:
+        sent         = await channel.send(**payload)
+        panel_msg_id = str(sent.id)
+    gid = str(interaction.guild_id)
+    _tc_upsert(gid, category_id=cfg.get("category_id"), log_channel_id=cfg.get("log_channel_id"),
+               support_role_ids=json.dumps(cfg.get("support_role_ids", [])),
+               panel_channel_id=cfg["channel_id"], panel_message_id=panel_msg_id)
+    for b in cfg["buttons"]:
+        _tq_upsert(gid, b["prefix"], json.dumps(b.get("questions", [])),
+                   b.get("category_id"), json.dumps(b["support_role_ids"]) if b.get("support_role_ids") else None)
+    listener = _make_panel_listener([b["prefix"] for b in cfg["buttons"]])
+    bot.add_view(listener, message_id=int(panel_msg_id))
+    ticket_panel_builders.pop(user_id, None)
+    verb = "Updated" if cfg.get("edit_message_id") else "Posted"
+    await interaction.followup.send(
+        embed=discord.Embed(color=0x57F287, title=f"✅ Panel {verb}!",
+                            description=f"Your ticket panel in {channel.mention} has been {verb.lower()}."),
+        ephemeral=True)
+
+
+# ─── /ticket subcommand group ─────────────────────────────────────────────────
+
+ticket_group = app_commands.Group(name="ticket", description="Ticket management commands")
+
+
+@ticket_group.command(name="panel", description="Build and post a customizable ticket panel")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(channel="Channel to post the panel in")
+async def ticket_panel_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.send_modal(TicketPanelInitModal(str(channel.id)))
+
+
+@ticket_group.command(name="close", description="Close the current ticket")
+@app_commands.describe(reason="Optional reason for closing")
+async def ticket_close_cmd(interaction: discord.Interaction, reason: str | None = None):
+    ticket = _tkt_by_channel(str(interaction.channel_id))
+    cfg    = _tc_get(str(interaction.guild_id))
+    if not ticket or ticket["status"] != "open":
+        return await interaction.response.send_message(
+            embed=discord.Embed(color=0xED4245, title="❌ Not a ticket",
+                                description="This command can only be used inside an open ticket channel."),
+            ephemeral=True)
+    roles     = _support_role_ids(cfg)
+    can_close = (
+        str(interaction.user.id) == ticket["owner_id"]
+        or any(interaction.user.get_role(int(r)) for r in roles)  # type: ignore[union-attr]
+        or interaction.user.guild_permissions.manage_channels       # type: ignore[union-attr]
+    )
+    if not can_close:
+        return await interaction.response.send_message(
+            embed=discord.Embed(color=0xED4245, title="❌ Permission denied",
+                                description="Only the ticket owner or staff can close this ticket."),
+            ephemeral=True)
+    await interaction.response.defer()
+    await _close_ticket(interaction, ticket, cfg)
+
+
+@ticket_group.command(name="rename", description="Rename this ticket channel")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(name="New name for the channel")
+async def ticket_rename_cmd(interaction: discord.Interaction, name: str):
+    ticket = _tkt_by_channel(str(interaction.channel_id))
+    if not ticket:
+        return await interaction.response.send_message(
+            embed=discord.Embed(color=0xED4245, title="❌ Not a ticket",
+                                description="This command can only be used inside a ticket channel."),
+            ephemeral=True)
+    new_name = re.sub(r"[^a-z0-9_-]", "-", name.lower())
+    new_name = re.sub(r"-{2,}", "-", new_name).strip("-")[:100]
+    if not new_name:
+        return await interaction.response.send_message(
+            embed=discord.Embed(color=0xED4245, title="❌ Invalid name",
+                                description="Channel name must contain at least one valid character."),
+            ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await interaction.channel.edit(name=new_name)
+    await interaction.followup.send(
+        embed=discord.Embed(color=0x57F287, title="✅ Renamed",
+                            description=f"Channel renamed to **{new_name}**."), ephemeral=True)
+
+
+@ticket_group.command(name="edit", description="Edit an existing bot message or ticket panel")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(message_id="The ID of the message to edit")
+async def ticket_edit_cmd(interaction: discord.Interaction, message_id: str):
+    try:
+        msg = await interaction.channel.fetch_message(int(message_id.strip()))
+    except Exception:
+        return await interaction.response.send_message(
+            embed=discord.Embed(color=0xED4245, title="❌ Not found",
+                                description="Could not find that message in this channel."), ephemeral=True)
+    if msg.author.id != interaction.client.user.id:
+        return await interaction.response.send_message(
+            embed=discord.Embed(color=0xED4245, title="❌ Not my message",
+                                description="I can only edit messages sent by me."), ephemeral=True)
+    is_panel = any(
+        c.custom_id and c.custom_id.startswith("ticket_create:")
+        for row in msg.components for c in row.children
+    )
+    if is_panel:
+        gid     = str(interaction.guild_id)
+        cfg     = _tc_get(gid)
+        embed_d = msg.embeds[0] if msg.embeds else None
+        buttons = []
+        for row in msg.components:
+            for comp in row.children:
+                if not (comp.custom_id and comp.custom_id.startswith("ticket_create:")):
+                    continue
+                pfx       = comp.custom_id.split(":", 1)[1]
+                q_row     = _tq_get(gid, pfx)
+                qs        = json.loads(q_row["questions"]) if q_row and q_row.get("questions") else []
+                cat       = q_row.get("category_id") if q_row else None
+                rids      = json.loads(q_row["support_role_ids"]) if q_row and q_row.get("support_role_ids") else []
+                style_map = {1: "blue", 3: "green", 4: "red", 2: "grey"}
+                em_str    = str(comp.emoji) if comp.emoji else ""
+                buttons.append({
+                    "label": comp.label or "", "emoji": em_str,
+                    "style": style_map.get(comp.style.value, "blue"),
+                    "prefix": pfx, "questions": qs, "category_id": cat, "support_role_ids": rids,
+                })
+        uid    = str(interaction.user.id)
+        config = {
+            "channel_id": str(msg.channel.id), "edit_message_id": str(msg.id),
+            "title": embed_d.title if embed_d else "", "description": embed_d.description if embed_d else "",
+            "color": embed_d.color.value if embed_d and embed_d.color else 0xF4A460,
+            "category_id": cfg.get("category_id") if cfg else None,
+            "log_channel_id": cfg.get("log_channel_id") if cfg else None,
+            "support_role_ids": _support_role_ids(cfg), "buttons": buttons,
+        }
+        ticket_panel_builders[uid] = config
+        v = PanelBuilderView(uid)
+        return await interaction.response.send_message(
+            embeds=[_panel_preview_embed(config), _panel_config_embed(config)], view=v, ephemeral=True)
+    await interaction.response.send_modal(EditMessageModal(msg))
+
+
+bot.tree.add_command(ticket_group)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  BOT EVENTS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1761,6 +2761,26 @@ async def on_ready():
     for gw_id, g in giveaways.items():
         if not g.get("ended"):
             bot.add_view(GiveawayView(gw_id))
+
+    # Re-register persistent ticket views
+    try:
+        c = _tdb()
+        all_cfgs = [dict(r) for r in c.execute("SELECT * FROM ticket_config").fetchall()]
+        open_tix = [dict(r) for r in c.execute("SELECT id FROM tickets WHERE status='open'").fetchall()]
+        c.close()
+        for cfg_row in all_cfgs:
+            pmid = cfg_row.get("panel_message_id")
+            if not pmid:
+                continue
+            qs_rows  = _tq_all(cfg_row["guild_id"])
+            prefixes = [r["prefix"] for r in qs_rows]
+            if prefixes:
+                bot.add_view(_make_panel_listener(prefixes), message_id=int(pmid))
+        for t in open_tix:
+            bot.add_view(TicketChannelView(t["id"]))
+        print(f"Registered {len(open_tix)} ticket channel view(s) and {len(all_cfgs)} panel view(s)")
+    except Exception as err:
+        print(f"[Ticket startup] {err}")
 
     update_all_counters.start()
     giveaway_checker.start()
