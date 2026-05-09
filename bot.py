@@ -1712,14 +1712,13 @@ async def on_message(message: discord.Message):
             counter["counts"][uid] = counter["counts"].get(uid, 0) + 1
     gs = load_guild_settings().get(str(guild_id), {})
     if gs.get("enabled") and gs.get("command_channels"):
-        if message.channel.id not in gs["command_channels"]:
+        if message.channel.id not in gs["command_channels"] and not _is_admin(message.author):
             if COMMAND_RE.search(message.content):
                 try:
                     await message.delete()
                 except discord.HTTPException:
                     pass
-            if not _is_admin(message.author):
-                return
+            return
     await bot.process_commands(message)
 
 
