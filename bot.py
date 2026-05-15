@@ -2698,6 +2698,344 @@ bot.tree.add_command(ticket_group)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PAID AD REMINDERS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PA_FILE = os.path.join(DATA_DIR, "paid_ads.json")
+
+# In-memory: { ad_id: { reminder_channel_id, role_ids, ad_channel_id, bought, paid,
+#               starts_ts, ends_ts, server, reminders_secs:[...], fired:[], guild_id } }
+paid_ads: dict[str, dict] = {}
+
+# Per-user wizard state while setting up an ad
+paid_ad_sessions: dict[str, dict] = {}
+
+# Combined schedule options: (label, [seconds_before_start, ...])
+PA_SCHEDULES = [
+    ("1 reminder — 15 min before",           [900]),
+    ("1 reminder — 30 min before",           [1800]),
+    ("1 reminder — 1 hour before",           [3600]),
+    ("1 reminder — 2 hours before",          [7200]),
+    ("2 reminders — 1h & 15min before",      [3600, 900]),
+    ("2 reminders — 2h & 1h before",         [7200, 3600]),
+    ("2 reminders — 3h & 1h before",         [10800, 3600]),
+    ("3 reminders — 3h, 1h & 15min before",  [10800, 3600, 900]),
+    ("3 reminders — 6h, 2h & 30min before",  [21600, 7200, 1800]),
+    ("4 reminders — 1d, 6h, 2h & 30min",     [86400, 21600, 7200, 1800]),
+]
+
+_PA_DT_FMTS = [
+    "%B %d, %Y %I:%M %p",
+    "%B %d, %Y %H:%M",
+    "%d/%m/%Y %H:%M",
+    "%Y-%m-%d %H:%M",
+    "%b %d, %Y %I:%M %p",
+    "%b %d, %Y %H:%M",
+]
+
+
+def _pa_load():
+    global paid_ads
+    if os.path.exists(PA_FILE):
+        with open(PA_FILE) as f:
+            paid_ads = json.load(f)
+
+
+def _pa_save():
+    with open(PA_FILE, "w") as f:
+        json.dump(paid_ads, f, indent=2)
+
+
+def _parse_ad_dt(text: str) -> datetime | None:
+    text = text.strip()
+    # Normalise AM/PM spacing
+    text = re.sub(r"(\d)\s+(AM|PM)", r"\1 \2", text, flags=re.IGNORECASE)
+    for fmt in _PA_DT_FMTS:
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def _pa_embed(ad: dict) -> discord.Embed:
+    starts = datetime.fromtimestamp(ad["starts_ts"], tz=timezone.utc)
+    ends   = datetime.fromtimestamp(ad["ends_ts"],   tz=timezone.utc)
+    roles  = " ".join(f"<@&{r}>" for r in ad.get("role_ids", []))
+    e = discord.Embed(title="📢 Paid Ad Details", color=0x5865F2)
+    e.add_field(name="Bought",       value=ad["bought"],                              inline=True)
+    e.add_field(name="Paid",         value=ad["paid"],                                inline=True)
+    e.add_field(name="​",       value="​",                                 inline=True)
+    e.add_field(name="Starts",       value=discord.utils.format_dt(starts, "F"),     inline=True)
+    e.add_field(name="Ends",         value=discord.utils.format_dt(ends,   "F"),     inline=True)
+    e.add_field(name="​",       value="​",                                 inline=True)
+    e.add_field(name="Ad Channel",   value=f"<#{ad['ad_channel_id']}>",              inline=True)
+    e.add_field(name="Server",       value=ad["server"],                             inline=True)
+    e.add_field(name="​",       value="​",                                 inline=True)
+    if roles:
+        e.add_field(name="Ping Roles", value=roles,                                  inline=False)
+    sched_labels = [
+        discord.utils.format_dt(datetime.fromtimestamp(ad["starts_ts"] - s, tz=timezone.utc), "R")
+        for s in sorted(ad["reminders_secs"], reverse=True)
+    ]
+    e.add_field(name="Reminders", value="\n".join(sched_labels) or "none", inline=False)
+    e.set_footer(text="Kongen & Kari's Helper • Paid Ad")
+    return e
+
+
+async def _post_paid_ad(interaction: discord.Interaction, user_id: str):
+    s = paid_ad_sessions.get(user_id)
+    if not s:
+        return await interaction.response.send_message("Session expired.", ephemeral=True)
+
+    missing = []
+    if not s.get("reminder_channel_id"): missing.append("reminder channel")
+    if not s.get("role_ids"):            missing.append("roles to ping")
+    if not s.get("ad_channel_id"):       missing.append("ad channel")
+    if not s.get("reminders_secs"):      missing.append("reminder schedule")
+    if not s.get("bought"):              missing.append("ad details (click Fill Ad Details)")
+    if missing:
+        return await interaction.response.send_message(
+            "Missing: " + ", ".join(missing), ephemeral=True)
+
+    ad_id = str(int(_time.time() * 1000))
+    ad = {
+        "guild_id":           str(interaction.guild_id),
+        "reminder_channel_id": s["reminder_channel_id"],
+        "role_ids":            s["role_ids"],
+        "ad_channel_id":       s["ad_channel_id"],
+        "bought":              s["bought"],
+        "paid":                s["paid"],
+        "starts_ts":           s["starts_ts"],
+        "ends_ts":             s["ends_ts"],
+        "server":              s["server"],
+        "reminders_secs":      s["reminders_secs"],
+        "fired":               [],
+    }
+    paid_ads[ad_id] = ad
+    _pa_save()
+    paid_ad_sessions.pop(user_id, None)
+
+    ch = interaction.guild.get_channel(int(s["reminder_channel_id"]))
+    if ch:
+        await ch.send(embed=_pa_embed(ad))
+
+    await interaction.response.edit_message(
+        content="Ad posted and reminders scheduled!", embed=None, view=None)
+
+
+class PaidAdModal(discord.ui.Modal, title="Ad Details"):
+    bought  = discord.ui.TextInput(label="Bought",  placeholder="e.g. 3 Days Nitro Ad",          max_length=100)
+    paid    = discord.ui.TextInput(label="Paid",    placeholder="e.g. 35€",                       max_length=50)
+    starts  = discord.ui.TextInput(label="Starts",  placeholder="e.g. June 8, 2026 6:00 PM",     max_length=60)
+    ends    = discord.ui.TextInput(label="Ends",    placeholder="e.g. June 11, 2026 6:00 PM",    max_length=60)
+    server  = discord.ui.TextInput(label="Server",  placeholder="e.g. https://discord.gg/…",      max_length=200)
+
+    def __init__(self, user_id: str):
+        super().__init__()
+        self._uid = user_id
+        s = paid_ad_sessions.get(user_id, {})
+        if s.get("bought"):  self.bought.default = s["bought"]
+        if s.get("paid"):    self.paid.default   = s["paid"]
+        if s.get("server"):  self.server.default = s["server"]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        s = paid_ad_sessions.setdefault(self._uid, {})
+
+        starts_dt = _parse_ad_dt(self.starts.value)
+        ends_dt   = _parse_ad_dt(self.ends.value)
+        if not starts_dt or not ends_dt:
+            return await interaction.response.send_message(
+                "Could not parse dates. Use format: `June 8, 2026 6:00 PM`", ephemeral=True)
+        if ends_dt <= starts_dt:
+            return await interaction.response.send_message(
+                "End date must be after start date.", ephemeral=True)
+
+        s["bought"]    = self.bought.value.strip()
+        s["paid"]      = self.paid.value.strip()
+        s["starts_ts"] = starts_dt.timestamp()
+        s["ends_ts"]   = ends_dt.timestamp()
+        s["server"]    = self.server.value.strip()
+
+        view = PaidAdView(self._uid)
+        await interaction.response.edit_message(
+            content=_pa_wizard_text(s), view=view)
+
+
+def _pa_wizard_text(s: dict) -> str:
+    lines = ["**Set up Paid Ad Reminder**\n"]
+    lines.append("**Reminder Channel:** " + (f"<#{s['reminder_channel_id']}>" if s.get("reminder_channel_id") else "not set"))
+    lines.append("**Roles:** " + (" ".join(f"<@&{r}>" for r in s.get("role_ids", [])) or "not set"))
+    lines.append("**Ad Channel:** " + (f"<#{s['ad_channel_id']}>" if s.get("ad_channel_id") else "not set"))
+    lines.append("**Schedule:** " + (s.get("schedule_label", "not set")))
+    if s.get("bought"):
+        lines.append(f"\n**Bought:** {s['bought']}  |  **Paid:** {s.get('paid','')}")
+        if s.get("starts_ts"):
+            starts = datetime.fromtimestamp(s["starts_ts"], tz=timezone.utc)
+            ends   = datetime.fromtimestamp(s["ends_ts"],   tz=timezone.utc)
+            lines.append(f"**Starts:** {discord.utils.format_dt(starts, 'F')}  |  **Ends:** {discord.utils.format_dt(ends, 'F')}")
+        lines.append(f"**Server:** {s.get('server','')}")
+    return "\n".join(lines)
+
+
+class PaidAdView(discord.ui.View):
+    def __init__(self, user_id: str):
+        super().__init__(timeout=600)
+        self._uid = user_id
+        self._add_selects()
+
+    def _add_selects(self):
+        self.clear_items()
+
+        reminder_ch = discord.ui.ChannelSelect(
+            placeholder="Select reminder channel (where embed & pings are posted)",
+            channel_types=[discord.ChannelType.text],
+            min_values=1, max_values=1, row=0,
+        )
+        reminder_ch.callback = self._reminder_channel_cb
+        self.add_item(reminder_ch)
+
+        role_sel = discord.ui.RoleSelect(
+            placeholder="Select roles to ping",
+            min_values=1, max_values=10, row=1,
+        )
+        role_sel.callback = self._role_cb
+        self.add_item(role_sel)
+
+        ad_ch = discord.ui.ChannelSelect(
+            placeholder="Select ad channel (where you'll post the ad)",
+            channel_types=[discord.ChannelType.text],
+            min_values=1, max_values=1, row=2,
+        )
+        ad_ch.callback = self._ad_channel_cb
+        self.add_item(ad_ch)
+
+        sched_opts = [
+            discord.SelectOption(label=label, value=str(i))
+            for i, (label, _) in enumerate(PA_SCHEDULES)
+        ]
+        sched_sel = discord.ui.Select(
+            placeholder="Select reminder schedule",
+            options=sched_opts, min_values=1, max_values=1, row=3,
+        )
+        sched_sel.callback = self._schedule_cb
+        self.add_item(sched_sel)
+
+        fill_btn = discord.ui.Button(label="Fill Ad Details", style=discord.ButtonStyle.primary,
+                                     emoji="📝", row=4)
+        fill_btn.callback = self._fill_details_cb
+        self.add_item(fill_btn)
+
+        s = paid_ad_sessions.get(self._uid, {})
+        ready = all([s.get("reminder_channel_id"), s.get("role_ids"),
+                     s.get("ad_channel_id"), s.get("reminders_secs"), s.get("bought")])
+        post_btn = discord.ui.Button(label="Post Ad & Set Reminders",
+                                     style=discord.ButtonStyle.success, emoji="✅",
+                                     disabled=not ready, row=4)
+        post_btn.callback = self._post_cb
+        self.add_item(post_btn)
+
+        cancel_btn = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger,
+                                       emoji="✖", row=4)
+        cancel_btn.callback = self._cancel_cb
+        self.add_item(cancel_btn)
+
+    async def _reminder_channel_cb(self, interaction: discord.Interaction):
+        s = paid_ad_sessions.setdefault(self._uid, {})
+        s["reminder_channel_id"] = str(interaction.data["values"][0])
+        self._add_selects()
+        await interaction.response.edit_message(content=_pa_wizard_text(s), view=self)
+
+    async def _role_cb(self, interaction: discord.Interaction):
+        s = paid_ad_sessions.setdefault(self._uid, {})
+        s["role_ids"] = interaction.data["values"]
+        self._add_selects()
+        await interaction.response.edit_message(content=_pa_wizard_text(s), view=self)
+
+    async def _ad_channel_cb(self, interaction: discord.Interaction):
+        s = paid_ad_sessions.setdefault(self._uid, {})
+        s["ad_channel_id"] = str(interaction.data["values"][0])
+        self._add_selects()
+        await interaction.response.edit_message(content=_pa_wizard_text(s), view=self)
+
+    async def _schedule_cb(self, interaction: discord.Interaction):
+        s = paid_ad_sessions.setdefault(self._uid, {})
+        idx = int(interaction.data["values"][0])
+        label, secs = PA_SCHEDULES[idx]
+        s["reminders_secs"]  = secs
+        s["schedule_label"]  = label
+        self._add_selects()
+        await interaction.response.edit_message(content=_pa_wizard_text(s), view=self)
+
+    async def _fill_details_cb(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(PaidAdModal(self._uid))
+
+    async def _post_cb(self, interaction: discord.Interaction):
+        await _post_paid_ad(interaction, self._uid)
+
+    async def _cancel_cb(self, interaction: discord.Interaction):
+        paid_ad_sessions.pop(self._uid, None)
+        await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
+
+
+@tasks.loop(minutes=1)
+async def paid_ad_checker():
+    now = _time.time()
+    changed = False
+    for ad_id, ad in list(paid_ads.items()):
+        starts = ad["starts_ts"]
+        for secs in ad["reminders_secs"]:
+            fire_at = starts - secs
+            key = str(secs)
+            if key not in ad["fired"] and now >= fire_at:
+                await _fire_paid_ad_reminder(ad_id, ad, secs)
+                ad["fired"].append(key)
+                changed = True
+    if changed:
+        _pa_save()
+
+
+@paid_ad_checker.before_loop
+async def before_paid_ad_checker():
+    await bot.wait_until_ready()
+
+
+async def _fire_paid_ad_reminder(ad_id: str, ad: dict, secs_before: int):
+    ch = bot.get_channel(int(ad["reminder_channel_id"]))
+    if not ch:
+        return
+    starts = datetime.fromtimestamp(ad["starts_ts"], tz=timezone.utc)
+    roles_mention = " ".join(f"<@&{r}>" for r in ad.get("role_ids", []))
+    mins = secs_before // 60
+    time_str = f"{mins} minute{'s' if mins != 1 else ''}" if mins < 60 else f"{secs_before // 3600} hour{'s' if secs_before // 3600 != 1 else ''}"
+    content = f"{roles_mention}\n⏰ **Reminder!** Ad starts in **{time_str}** ({discord.utils.format_dt(starts, 'R')})"
+    e = discord.Embed(title="📢 Time to Post Your Ad!", color=0xFF4500)
+    e.add_field(name="Bought",      value=ad["bought"],                          inline=True)
+    e.add_field(name="Paid",        value=ad["paid"],                            inline=True)
+    e.add_field(name="​",      value="​",                              inline=True)
+    e.add_field(name="Starts",      value=discord.utils.format_dt(starts, "F"), inline=True)
+    e.add_field(name="Ad Channel",  value=f"<#{ad['ad_channel_id']}>",          inline=True)
+    e.add_field(name="Server",      value=ad["server"],                          inline=True)
+    e.set_footer(text="Kongen & Kari's Helper • Paid Ad Reminder")
+    try:
+        await ch.send(content=content, embed=e)
+    except discord.HTTPException:
+        pass
+
+
+@app_commands.command(name="paidad", description="Set up a paid ad reminder (admin only)")
+@app_commands.default_permissions(administrator=True)
+async def paidad_cmd(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    paid_ad_sessions[uid] = {}
+    view = PaidAdView(uid)
+    await interaction.response.send_message(
+        content=_pa_wizard_text({}), view=view, ephemeral=True)
+
+bot.tree.add_command(paidad_cmd)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  BOT EVENTS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2782,8 +3120,12 @@ async def on_ready():
     except Exception as err:
         print(f"[Ticket startup] {err}")
 
+    _pa_load()
+    print(f"Loaded {len(paid_ads)} paid ad(s)")
+
     update_all_counters.start()
     giveaway_checker.start()
+    paid_ad_checker.start()
     await _update_presence()
 
     for guild in GUILD_IDS:
