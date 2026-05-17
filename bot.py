@@ -27,7 +27,31 @@ class RestrictedCommandTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if _is_admin(interaction.user):
             return True
+
         settings = load_guild_settings().get(str(interaction.guild_id), {})
+
+        # ticket/close is public — anyone in the right channel can use it
+        cmd = interaction.command
+        is_ticket_close = (
+            cmd is not None
+            and cmd.name == "close"
+            and getattr(cmd.parent, "name", None) == "ticket"
+        )
+
+        if not is_ticket_close:
+            permitted = settings.get("permitted_roles", [])
+            has_perm  = (
+                isinstance(interaction.user, discord.Member)
+                and any(r.id in permitted for r in interaction.user.roles)
+            )
+            if not has_perm:
+                await interaction.response.send_message(
+                    "You don't have permission to use bot commands. "
+                    "A server admin can grant your role access with `/rolepermission`.",
+                    ephemeral=True,
+                )
+                return False
+
         if not settings.get("enabled") or not settings.get("command_channels"):
             return True
         if interaction.channel_id in settings["command_channels"]:
@@ -1490,6 +1514,30 @@ async def commandblock_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
 
+@bot.tree.command(name="rolepermission", description="Grant or revoke a role's access to use bot commands (admin only)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(role="The role to grant or revoke bot command access")
+async def rolepermission_cmd(interaction: discord.Interaction, role: discord.Role):
+    data = load_guild_settings()
+    gid  = str(interaction.guild_id)
+    gs   = data.get(gid, {})
+    permitted = gs.get("permitted_roles", [])
+    if role.id in permitted:
+        permitted.remove(role.id)
+        desc   = f"{role.mention} has been **removed** from bot permissions."
+        color  = 0xED4245
+    else:
+        permitted.append(role.id)
+        desc   = f"{role.mention} has been **granted** bot command access."
+        color  = 0x57F287
+    gs["permitted_roles"] = permitted
+    data[gid] = gs
+    save_guild_settings(data)
+    await interaction.response.send_message(
+        embed=discord.Embed(color=color, description=desc), ephemeral=True
+    )
+
+
 @bot.check
 async def _prefix_channel_check(ctx: commands.Context) -> bool:
     if not ctx.guild or _is_admin(ctx.author):
@@ -1505,7 +1553,6 @@ async def _prefix_channel_check(ctx: commands.Context) -> bool:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @bot.tree.command(name="leaderboard", description="Create a leaderboard")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     type="Type of leaderboard",
     name="Name for the chat counter (required for chat_counter type)",
@@ -1581,7 +1628,6 @@ async def lb_autocomplete(interaction: discord.Interaction, current: str):
 
 
 @bot.tree.command(name="editleaderboard", description="Edit a saved leaderboard")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(name="Name of the leaderboard to edit")
 @app_commands.autocomplete(name=lb_autocomplete)
 async def editleaderboard_cmd(interaction: discord.Interaction, name: str):
@@ -1600,7 +1646,6 @@ async def editleaderboard_cmd(interaction: discord.Interaction, name: str):
 
 
 @bot.tree.command(name="leaderboardlist", description="List all saved leaderboards on this server")
-@app_commands.default_permissions(administrator=True)
 async def leaderboardlist_cmd(interaction: discord.Interaction):
     guild_lbs = get_guild_leaderboards(interaction.guild.id)
     if not guild_lbs:
@@ -1612,7 +1657,6 @@ async def leaderboardlist_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="leaderboardname", description="Find the saved name of a leaderboard by its message ID")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(message_id="The message ID of the posted leaderboard")
 async def leaderboardname_cmd(interaction: discord.Interaction, message_id: str):
     await interaction.response.defer(ephemeral=True)
@@ -1650,7 +1694,6 @@ async def leaderboardname_cmd(interaction: discord.Interaction, message_id: str)
 
 
 @bot.tree.command(name="embed", description="Build and post a fully custom embed")
-@app_commands.default_permissions(administrator=True)
 async def embed_cmd(interaction: discord.Interaction):
     sid = f"{interaction.user.id}_{interaction.id}"
     emb_sessions[sid] = _blank_emb(interaction.user.id)
@@ -1662,7 +1705,6 @@ async def embed_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="giveaway", description="Start a giveaway in this channel")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     prize="What are you giving away?",
     duration="How long to run — e.g. 30s  5m  2h  1d  1w  combine: 1d12h",
@@ -1713,7 +1755,6 @@ async def giveaway_cmd(
 
 
 @bot.tree.command(name="giveaway-end", description="Immediately end an active giveaway by message ID")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(message_id="The message ID of the giveaway to end")
 async def giveaway_end_cmd(interaction: discord.Interaction, message_id: str):
     try:
@@ -1730,7 +1771,6 @@ async def giveaway_end_cmd(interaction: discord.Interaction, message_id: str):
 
 
 @bot.tree.command(name="giveaway-reroll", description="Reroll the winner(s) of an ended giveaway")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(message_id="The message ID of the ended giveaway")
 async def giveaway_reroll_cmd(interaction: discord.Interaction, message_id: str):
     try:
@@ -2634,7 +2674,6 @@ ticket_group = app_commands.Group(name="ticket", description="Ticket management 
 
 
 @ticket_group.command(name="panel", description="Build and post a customizable ticket panel")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(channel="Channel to post the panel in")
 async def ticket_panel_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
     await interaction.response.send_modal(TicketPanelInitModal(str(channel.id)))
@@ -2666,7 +2705,6 @@ async def ticket_close_cmd(interaction: discord.Interaction, reason: str | None 
 
 
 @ticket_group.command(name="rename", description="Rename this ticket channel")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(name="New name for the channel")
 async def ticket_rename_cmd(interaction: discord.Interaction, name: str):
     ticket = _tkt_by_channel(str(interaction.channel_id))
@@ -2690,7 +2728,6 @@ async def ticket_rename_cmd(interaction: discord.Interaction, name: str):
 
 
 @ticket_group.command(name="edit", description="Edit an existing bot message or ticket panel")
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(message_id="The ID of the message to edit")
 async def ticket_edit_cmd(interaction: discord.Interaction, message_id: str):
     try:
@@ -2775,11 +2812,9 @@ PA_SCHEDULES = [
 ]
 
 _PA_DT_FMTS = [
-    "%B %d, %Y %I:%M %p",
     "%B %d, %Y %H:%M",
     "%d/%m/%Y %H:%M",
     "%Y-%m-%d %H:%M",
-    "%b %d, %Y %I:%M %p",
     "%b %d, %Y %H:%M",
 ]
 
@@ -2798,8 +2833,6 @@ def _pa_save():
 
 def _parse_ad_dt(text: str) -> datetime | None:
     text = text.strip()
-    # Normalise AM/PM spacing
-    text = re.sub(r"(\d)\s+(AM|PM)", r"\1 \2", text, flags=re.IGNORECASE)
     for fmt in _PA_DT_FMTS:
         try:
             return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
@@ -2877,8 +2910,8 @@ async def _post_paid_ad(interaction: discord.Interaction, user_id: str):
 class PaidAdModal(discord.ui.Modal, title="Ad Details"):
     bought  = discord.ui.TextInput(label="Bought",  placeholder="e.g. 3 Days Nitro Ad",          max_length=100)
     paid    = discord.ui.TextInput(label="Paid",    placeholder="e.g. 35€",                       max_length=50)
-    starts  = discord.ui.TextInput(label="Starts",  placeholder="e.g. June 8, 2026 6:00 PM",     max_length=60)
-    ends    = discord.ui.TextInput(label="Ends",    placeholder="e.g. June 11, 2026 6:00 PM",    max_length=60)
+    starts  = discord.ui.TextInput(label="Starts",  placeholder="e.g. June 8, 2026 18:00",        max_length=60)
+    ends    = discord.ui.TextInput(label="Ends",    placeholder="e.g. June 11, 2026 18:00",       max_length=60)
     server  = discord.ui.TextInput(label="Server",  placeholder="e.g. https://discord.gg/…",      max_length=200)
 
     def __init__(self, user_id: str):
@@ -2896,7 +2929,7 @@ class PaidAdModal(discord.ui.Modal, title="Ad Details"):
         ends_dt   = _parse_ad_dt(self.ends.value)
         if not starts_dt or not ends_dt:
             return await interaction.response.send_message(
-                "Could not parse dates. Use format: `June 8, 2026 6:00 PM`", ephemeral=True)
+                "Could not parse dates. Use format: `June 8, 2026 18:00`", ephemeral=True)
         if ends_dt <= starts_dt:
             return await interaction.response.send_message(
                 "End date must be after start date.", ephemeral=True)
@@ -3074,7 +3107,6 @@ async def _fire_paid_ad_reminder(ad_id: str, ad: dict, secs_before: int):
 
 
 @app_commands.command(name="paidad", description="Set up a paid ad reminder (admin only)")
-@app_commands.default_permissions(administrator=True)
 async def paidad_cmd(interaction: discord.Interaction):
     uid = str(interaction.user.id)
     paid_ad_sessions[uid] = {}
