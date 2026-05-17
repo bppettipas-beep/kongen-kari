@@ -40,10 +40,16 @@ class RestrictedCommandTree(app_commands.CommandTree):
 
         if not is_ticket_close:
             permitted = settings.get("permitted_roles", [])
-            has_perm  = (
-                isinstance(interaction.user, discord.Member)
-                and any(r.id in permitted for r in interaction.user.roles)
-            )
+            has_perm  = False
+            if isinstance(interaction.user, discord.Member) and permitted:
+                guild           = interaction.guild
+                permitted_roles = [guild.get_role(rid) for rid in permitted]
+                min_pos         = min(
+                    (r.position for r in permitted_roles if r is not None),
+                    default=None,
+                )
+                if min_pos is not None:
+                    has_perm = any(r.position >= min_pos for r in interaction.user.roles)
             if not has_perm:
                 await interaction.response.send_message(
                     "You don't have permission to use bot commands. "
