@@ -1599,6 +1599,18 @@ async def editleaderboard_cmd(interaction: discord.Interaction, name: str):
     )
 
 
+@bot.tree.command(name="leaderboardlist", description="List all saved leaderboards on this server")
+@app_commands.default_permissions(administrator=True)
+async def leaderboardlist_cmd(interaction: discord.Interaction):
+    guild_lbs = get_guild_leaderboards(interaction.guild.id)
+    if not guild_lbs:
+        return await interaction.response.send_message("No leaderboards saved on this server.", ephemeral=True)
+    names = "\n".join(f"• **{n}**" for n in guild_lbs)
+    await interaction.response.send_message(
+        f"**Leaderboards ({len(guild_lbs)}):**\n{names}", ephemeral=True
+    )
+
+
 @bot.tree.command(name="embed", description="Build and post a fully custom embed")
 @app_commands.default_permissions(administrator=True)
 async def embed_cmd(interaction: discord.Interaction):
