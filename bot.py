@@ -88,7 +88,7 @@ GW_FILE     = os.path.join(DATA_DIR, "giveaways.json")
 GS_FILE     = os.path.join(DATA_DIR, "guild_settings.json")
 TICKET_DB   = os.path.join(DATA_DIR, "tickets.db")
 
-COMMAND_RE = re.compile(r"^[^\w\s]\w", re.UNICODE)
+COMMAND_RE = re.compile(r"^[^\w\s:]\w", re.UNICODE)
 
 GW_YELLOW = 0xFFD700
 
