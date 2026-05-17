@@ -1611,6 +1611,44 @@ async def leaderboardlist_cmd(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(name="leaderboardname", description="Find the saved name of a leaderboard by its message ID")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(message_id="The message ID of the posted leaderboard")
+async def leaderboardname_cmd(interaction: discord.Interaction, message_id: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        mid = int(message_id)
+    except ValueError:
+        return await interaction.followup.send("Invalid message ID.", ephemeral=True)
+
+    target_msg = None
+    for channel in interaction.guild.text_channels:
+        try:
+            target_msg = await channel.fetch_message(mid)
+            break
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            continue
+
+    if not target_msg:
+        return await interaction.followup.send("Message not found in any channel.", ephemeral=True)
+    if not target_msg.embeds:
+        return await interaction.followup.send("That message has no embed.", ephemeral=True)
+
+    raw_title = target_msg.embeds[0].title or ""
+    clean_title = raw_title.lstrip("🏆").strip()
+
+    guild_lbs = get_guild_leaderboards(interaction.guild.id)
+    matches = [name for name, data in guild_lbs.items() if data.get("title", "").strip() == clean_title]
+
+    if not matches:
+        return await interaction.followup.send(
+            f"No saved leaderboard matched the title **{clean_title}**.", ephemeral=True
+        )
+    await interaction.followup.send(
+        f"Leaderboard name: **{matches[0]}**", ephemeral=True
+    )
+
+
 @bot.tree.command(name="embed", description="Build and post a fully custom embed")
 @app_commands.default_permissions(administrator=True)
 async def embed_cmd(interaction: discord.Interaction):
